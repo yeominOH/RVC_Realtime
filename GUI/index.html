@@ -155,7 +155,7 @@
 
     .session-panel .waterline { margin-bottom: 24px; }
     .control-label {
-      margin: 18px 0 6px;
+      margin: 18px 0 8px;
       font-size: 10px;
       font-weight: 600;
       letter-spacing: .13em;
@@ -203,6 +203,26 @@
       background: #b9aeb9;
     }
     .status-dot.live { background: #68bca9; box-shadow: 0 0 0 3px rgba(104,188,169,.13); }
+
+    .stream-card {
+      width: 132px;
+      min-height: 118px;
+      padding: 16px 11px;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      background: rgba(255,252,246,.32);
+      color: var(--muted);
+      font-size: 9.5px;
+      line-height: 1.55;
+    }
+    .stream-title {
+      margin-bottom: 10px;
+      color: var(--ink);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .08em;
+    }
+    .stream-hint { margin-top: 12px; opacity: .78; }
 
     .bottom-bar {
       position: absolute;
@@ -310,13 +330,11 @@
         <path class="wave" stroke="#db8b83" d="M1 8 C8 3, 15 11, 22 5 S35 2, 42 7 S52 9, 61 4"/>
         <path class="wave" stroke="#e8bd67" opacity=".8" d="M35 7 C43 3, 52 8, 61 5"/>
       </svg>
-      <div class="control-label">Track audio</div>
-      <button id="captureButton" class="action" type="button">CAPTURE</button>
-      <div class="control-label">Voice conversion</div>
-      <button id="renderButton" class="action" type="button" disabled>RENDER</button>
-      <div class="status-card">
-        <div><span id="statusDot" class="status-dot"></span><span id="captureStatus">Capture idle</span></div>
-        <div id="renderStatus">Waiting for capture</div>
+      <div class="control-label">Live conversion</div>
+      <div class="stream-card">
+        <div class="stream-title"><span id="statusDot" class="status-dot"></span>STREAM</div>
+        <div id="streamStatus">Loading RVC model</div>
+        <div class="stream-hint">Turn RVC on, then press play in your DAW.</div>
       </div>
     </section>
 
@@ -337,14 +355,9 @@
       const valueLabel = document.getElementById('pitchValue');
       const ticks = document.getElementById('ticks');
       const modelSelect = document.getElementById('modelSelect');
-      const captureButton = document.getElementById('captureButton');
-      const renderButton = document.getElementById('renderButton');
       const bypassButton = document.getElementById('bypassButton');
       let pitch = 0;
       let dragging = false;
-      let captureActive = false;
-      let lastCaptureCommandAt = -1000;
-      let lastRenderCommandAt = -1000;
       let modelSignature = '';
 
       const send = (event, value = {}) => {
@@ -409,30 +422,6 @@
         send('selectModel', Number(modelSelect.value));
         releaseKeyboardFocus();
       });
-      const requestCaptureChange = event => {
-        event.preventDefault();
-        event.stopPropagation();
-
-        const now = performance.now();
-        if (now - lastCaptureCommandAt < 250) return;
-        lastCaptureCommandAt = now;
-        send('setCapture', !captureActive);
-        releaseKeyboardFocus();
-      };
-      captureButton.addEventListener('pointerdown', requestCaptureChange);
-      captureButton.addEventListener('click', requestCaptureChange);
-      const requestRender = event => {
-        event.preventDefault();
-        event.stopPropagation();
-
-        const now = performance.now();
-        if (now - lastRenderCommandAt < 250) return;
-        lastRenderCommandAt = now;
-        send('render');
-        releaseKeyboardFocus();
-      };
-      renderButton.addEventListener('pointerdown', requestRender);
-      renderButton.addEventListener('click', requestRender);
       bypassButton.addEventListener('click', () => {
         send('togglePower', !bypassButton.classList.contains('on'));
         releaseKeyboardFocus();
@@ -446,16 +435,9 @@
         if (!dragging) setPitch(Number(state.pitch || 0));
         bypassButton.classList.toggle('on', Boolean(state.enabled));
         bypassButton.textContent = state.enabled ? 'RVC ON' : 'BYPASS';
-        captureActive = Boolean(state.capturing);
-        captureButton.classList.toggle('active', Boolean(state.capturing));
-        captureButton.textContent = state.capturing ? 'STOP CAPTURE' : 'CAPTURE';
-        renderButton.classList.toggle('active', Boolean(state.rendering));
-        renderButton.textContent = state.rendering ? 'RENDERING…' : 'RENDER';
-        renderButton.disabled = !state.canRender;
-        document.getElementById('captureStatus').textContent = state.captureStatus || 'Capture idle';
-        document.getElementById('renderStatus').textContent = state.renderStatus || 'Waiting for capture';
-        document.getElementById('statusDot').classList.toggle('live', Boolean(state.capturing || state.rendering || state.vocalDetected));
-        document.getElementById('renderBadge').textContent = state.rendering ? 'CONVERTING VOICE…' : (state.renderStatus || 'RVC READY');
+        document.getElementById('streamStatus').textContent = state.engineStatus || 'Streaming engine idle';
+        document.getElementById('statusDot').classList.toggle('live', Boolean(state.enabled && (state.modelLoaded || state.vocalDetected)));
+        document.getElementById('renderBadge').textContent = state.engineStatus || 'RVC READY';
 
         const signature = JSON.stringify(state.models || []);
         if (signature !== modelSignature) {

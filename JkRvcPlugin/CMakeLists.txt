@@ -18,7 +18,8 @@ juce_add_binary_data(RvcWebAssets
         ../GUI/index.html
         ../GUI/vocalify_background.png
         ../GUI/pitch_slider_track.png
-        ../GUI/pitch_slider_thumb.png)
+        ../GUI/pitch_slider_thumb.png
+        Runtime/rvc_stream_worker.py)
 
 juce_add_plugin(JkRvcPlugin
     COMPANY_NAME "RVC_ONNX"

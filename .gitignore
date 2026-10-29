@@ -214,6 +214,10 @@ htmlcov/
 # Type checkers
 .mypy_cache/
 
+# Local RVC model source used for conversion/testing. Runtime models are
+# installed separately under ~/Library/Application Support/RVC/Runtime.
+/test_261015.pth
+
 # Jupyter Notebook
 .ipynb_checkpoints
 

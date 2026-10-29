@@ -1,6 +1,6 @@
 # RVC AU Plugin
 
-JUCE-based macOS Audio Unit that captures audio from a DAW track and renders it through an RVC model in the background.
+JUCE-based macOS Audio Unit that converts DAW playback through an RVC model without a manual capture/render pass.
 
 ## Current Target
 
@@ -28,17 +28,18 @@ That directory contains:
 
 The installed AU remains small and resolves this shared runtime when it loads. Do not remove the shared runtime directory while using the plugin.
 
-## Workflow
+## Streaming Workflow
 
 1. Insert `RVC` on a vocal track.
 2. Choose Ariana Grande or Jungkook.
 3. Set the pitch shift if needed.
-4. Click `Capture` and play the desired section in the DAW.
-5. Click `Render`; an active capture is stopped automatically.
-6. Wait until the status changes to `Render ready`.
-7. Enable `RVC ON` and play the captured timeline section.
+4. Opening the plugin editor immediately preloads and warms up the selected model. Changing the model restarts the worker and loads the new model automatically.
+5. Wait until the status changes from `Model loading...` to `Model loaded`.
+6. Enable `RVC ON` and press play in the DAW. Input is collected into overlapping chunks, converted on a background worker, and returned automatically.
 
-This is a capture-and-render workflow, not low-latency streaming voice conversion.
+The streaming path uses a persistent Python worker, shared-memory audio exchange, lock-free FIFOs, a 640 ms rolling analysis window, timeline-locked equal-power crossfades, and a 20 ms overlap. Each 200 ms output hop is taken from the interior of that window with about 340 ms of past context and 80 ms of future context. The 200 ms hop lands on exact 50 Hz ContentVec/HuBERT and 100 Hz F0/RVC frame boundaries; finalized past and splice conditioning frames are carried forward on one continuous timeline, and overlapping RVC frames reuse the same latent noise. Pitch is sent as a live per-request value, so moving the slider does not reload the worker or model. The AU reports a fixed 600 ms startup/output latency to the DAW, allowing plug-in delay compensation to align prerecorded tracks with extra first-render scheduling headroom. The UI bypass keeps the converter warm, emits a 600 ms delayed dry signal, and uses a 20 ms equal-power wet/dry fade so toggling it during playback remains PDC-aligned without a click. If conversion misses a deadline, late samples are discarded against the absolute host timeline instead of accumulating latency; the stream status reports underrun count (`U`), backlog recoveries (`B`), and skipped samples (`S`).
+
+ARA remains disabled. It can be added later as an optional mode without replacing this normal insert-effect path.
 
 ## Build
 

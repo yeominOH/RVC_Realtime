@@ -17,6 +17,8 @@ std::vector<std::byte> copyResource(const char* data, int size)
 JkRvcAudioProcessorEditor::JkRvcAudioProcessorEditor(JkRvcAudioProcessor& p)
     : AudioProcessorEditor(&p), audioProcessor(p)
 {
+    audioProcessor.requestModelPreload();
+
     auto options = juce::WebBrowserComponent::Options{}
         .withNativeIntegrationEnabled()
         .withKeepPageLoadedWhenBrowserIsHidden()
@@ -36,25 +38,6 @@ JkRvcAudioProcessorEditor::JkRvcAudioProcessorEditor(JkRvcAudioProcessor& p)
                 parameter->setValueNotifyingHost((bool) value ? 1.0f : 0.0f);
                 parameter->endChangeGesture();
             }
-        })
-        .withEventListener("setCapture", [this] (const juce::var& value)
-        {
-            const auto shouldCapture = (bool) value;
-
-            if (shouldCapture && ! audioProcessor.isCapturing())
-                audioProcessor.startCapture();
-            else if (! shouldCapture && audioProcessor.isCapturing())
-                audioProcessor.stopCapture();
-
-            publishUiState();
-        })
-        .withEventListener("render", [this] (const juce::var&)
-        {
-            if (audioProcessor.isCapturing())
-                audioProcessor.stopCapture();
-
-            audioProcessor.startManualRender();
-            publishUiState();
         })
         .withEventListener("releaseKeyboardFocus", [this] (const juce::var&)
         {
@@ -115,13 +98,9 @@ void JkRvcAudioProcessorEditor::publishUiState()
 
     state->setProperty("pitch", audioProcessor.getPitchShiftSemitones());
     state->setProperty("enabled", enabled);
-    state->setProperty("capturing", audioProcessor.isCapturing());
-    state->setProperty("rendering", audioProcessor.isRendering());
-    state->setProperty("canRender", audioProcessor.hasCapturedAudio()
-                                      && ! audioProcessor.isRendering());
     state->setProperty("selectedModel", audioProcessor.getSelectedModelIndex());
-    state->setProperty("captureStatus", audioProcessor.getCaptureStatus());
-    state->setProperty("renderStatus", audioProcessor.getRenderStatus());
+    state->setProperty("engineStatus", audioProcessor.getEngineStatus());
+    state->setProperty("modelLoaded", audioProcessor.isModelReady());
     state->setProperty("vocalDetected", audioProcessor.getLastVocalDetected());
 
     juce::Array<juce::var> models;

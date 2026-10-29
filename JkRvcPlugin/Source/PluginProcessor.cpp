@@ -1,9 +1,11 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "BinaryData.h"
 
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 #if JUCE_MAC
 #include <dlfcn.h>
@@ -19,6 +21,8 @@ JkRvcAudioProcessor::JkRvcAudioProcessor()
 {
     formatManager.registerBasicFormats();
     loadModelChoices();
+    streamingWorkerScript = installStreamingWorkerScript();
+    configureStreamingEngine();
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout JkRvcAudioProcessor::createParameters()
@@ -28,7 +32,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout JkRvcAudioProcessor::createP
     params.push_back(std::make_unique<juce::AudioParameterBool>(
         juce::ParameterID { "rvcEnabled", 1 },
         "RVC On",
-        false));
+        true));
 
     return { params.begin(), params.end() };
 }
@@ -37,7 +41,25 @@ void JkRvcAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
     currentSampleRate = sampleRate > 0.0 ? sampleRate : 44100.0;
 
+    configureStreamingEngine();
     engine.prepare(sampleRate, samplesPerBlock);
+    // The streaming engine intentionally emits a fixed amount of leading
+    // silence while the first RVC block is being converted.  Report that
+    // exact contract to the host so prerecorded tracks are aligned by the
+    // DAW's plug-in delay compensation instead of sounding late.
+    setLatencySamples(engine.getLatencySamples());
+
+    pdcLatencySamples = engine.getLatencySamples();
+    pdcDryDelayBuffer.setSize(juce::jmax(1, getTotalNumInputChannels()),
+                              juce::jmax(1, pdcLatencySamples), false, true, true);
+    pdcDryDelayBuffer.clear();
+    pdcDelayedDryBlock.setSize(juce::jmax(1, getTotalNumOutputChannels()),
+                               juce::jmax(1, samplesPerBlock), false, true, true);
+    pdcDelayedDryBlock.clear();
+    pdcDryDelayPosition = 0;
+    pdcTransportWasPlaying = false;
+    bypassFadeLengthSamples = juce::jmax(1, (int) std::round(currentSampleRate * 0.02));
+    bypassDryMix = state.getRawParameterValue("rvcEnabled")->load() > 0.5f ? 0.0f : 1.0f;
 
     {
         const juce::ScopedLock lock(captureLock);
@@ -78,36 +100,116 @@ void JkRvcAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
 
     const auto enabled = state.getRawParameterValue("rvcEnabled")->load() > 0.5f;
 
+    // Keep the converter running while the UI is bypassed.  This makes a
+    // mid-playback return to RVC instantaneous and keeps the wet and delayed
+    // dry paths on the same continuous timeline.
+    engine.setEnabled(true);
+
     const auto vocalDetected = engine.detectVocal(buffer);
     lastVocalDetected.store(vocalDetected);
 
-    const auto capturing = captureActive.load();
-    if (capturing)
+    auto isPlaying = true;
+    if (auto* playHead = getPlayHead())
+        isPlaying = playHead->getPosition()->getIsPlaying();
+    engine.setTransportPlaying(isPlaying);
+
+    if (captureActive.load())
         appendInputToCaptureBuffer(buffer);
 
-    if (! enabled)
+    if (! isPlaying)
     {
-        renderedPlaybackWasAudible.store(false);
-        return;
-    }
-
-    if (capturing)
-    {
-        renderedPlaybackWasAudible.store(false);
-        return;
-    }
-
-    if (auto* playHead = getPlayHead())
-    {
-        if (! playHead->getPosition()->getIsPlaying())
+        if (pdcTransportWasPlaying)
         {
-            cutRenderedPlaybackToSilence(buffer);
-            return;
+            pdcDryDelayBuffer.clear();
+            pdcDelayedDryBlock.clear();
+            pdcDryDelayPosition = 0;
+        }
+        pdcTransportWasPlaying = false;
+        return;
+    }
+
+    if (! pdcTransportWasPlaying)
+    {
+        pdcDryDelayBuffer.clear();
+        pdcDelayedDryBlock.clear();
+        pdcDryDelayPosition = 0;
+        pdcTransportWasPlaying = true;
+    }
+
+    // Capture the PDC-aligned dry signal before the engine replaces the
+    // buffer with converted audio.
+    advancePdcDryDelay(buffer);
+
+    if (isPlaying)
+        engine.process(buffer);
+
+    applyRvcBypassFade(buffer, enabled);
+}
+
+void JkRvcAudioProcessor::advancePdcDryDelay(juce::AudioBuffer<float>& buffer) noexcept
+{
+    const auto channels = buffer.getNumChannels();
+    const auto samples = buffer.getNumSamples();
+
+    if (pdcDelayedDryBlock.getNumChannels() < channels
+        || pdcDelayedDryBlock.getNumSamples() < samples)
+        pdcDelayedDryBlock.setSize(channels, samples, false, false, true);
+
+    if (pdcLatencySamples <= 0 || pdcDryDelayBuffer.getNumSamples() < pdcLatencySamples)
+    {
+        for (int channel = 0; channel < channels; ++channel)
+            pdcDelayedDryBlock.copyFrom(channel, 0, buffer, channel, 0, samples);
+    }
+    else
+    {
+        const auto delayChannels = pdcDryDelayBuffer.getNumChannels();
+        for (int sample = 0; sample < samples; ++sample)
+        {
+            for (int channel = 0; channel < channels; ++channel)
+            {
+                const auto delayChannel = juce::jmin(channel, delayChannels - 1);
+                const auto input = buffer.getSample(channel, sample);
+                const auto delayed = pdcDryDelayBuffer.getSample(delayChannel, pdcDryDelayPosition);
+                pdcDryDelayBuffer.setSample(delayChannel, pdcDryDelayPosition, input);
+                pdcDelayedDryBlock.setSample(channel, sample, delayed);
+            }
+
+            if (++pdcDryDelayPosition >= pdcLatencySamples)
+                pdcDryDelayPosition = 0;
+        }
+    }
+}
+
+void JkRvcAudioProcessor::applyRvcBypassFade(juce::AudioBuffer<float>& wetBuffer,
+                                              bool rvcEnabled) noexcept
+{
+    const auto channels = juce::jmin(wetBuffer.getNumChannels(), pdcDelayedDryBlock.getNumChannels());
+    const auto samples = juce::jmin(wetBuffer.getNumSamples(), pdcDelayedDryBlock.getNumSamples());
+    const auto targetDryMix = rvcEnabled ? 0.0f : 1.0f;
+    const auto step = 1.0f / (float) juce::jmax(1, bypassFadeLengthSamples);
+
+    for (int sample = 0; sample < samples; ++sample)
+    {
+        if (bypassDryMix < targetDryMix)
+            bypassDryMix = juce::jmin(targetDryMix, bypassDryMix + step);
+        else if (bypassDryMix > targetDryMix)
+            bypassDryMix = juce::jmax(targetDryMix, bypassDryMix - step);
+
+        const auto phase = bypassDryMix * juce::MathConstants<float>::halfPi;
+        const auto wetGain = std::cos(phase);
+        const auto dryGain = std::sin(phase);
+        for (int channel = 0; channel < channels; ++channel)
+        {
+            const auto wet = wetBuffer.getSample(channel, sample);
+            const auto dry = pdcDelayedDryBlock.getSample(channel, sample);
+            wetBuffer.setSample(channel, sample, wet * wetGain + dry * dryGain);
         }
     }
 
-    if (! playRenderedAudioForCurrentPosition(buffer))
-        renderedPlaybackWasAudible.store(false);
+    for (int channel = channels; channel < wetBuffer.getNumChannels(); ++channel)
+        wetBuffer.clear(channel, 0, wetBuffer.getNumSamples());
+    if (samples < wetBuffer.getNumSamples())
+        wetBuffer.clear(samples, wetBuffer.getNumSamples() - samples);
 }
 
 void JkRvcAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
@@ -158,6 +260,8 @@ void JkRvcAudioProcessor::setSelectedModelIndex(int index)
     renderReady.store(false);
     renderFailed.store(false);
     renderMessage = "Ready to render";
+    configureStreamingEngine();
+    engine.requestPreload();
 }
 
 void JkRvcAudioProcessor::setPitchShiftSemitones(int semitones)
@@ -166,15 +270,21 @@ void JkRvcAudioProcessor::setPitchShiftSemitones(int semitones)
     if (pitchShiftSemitones.exchange(clamped) == clamped)
         return;
 
-    const juce::ScopedLock lock(renderedLock);
-    renderedAudio.setSize(0, 0);
-    renderedPlaybackPosition = 0;
-    renderedPlayableSamples = 0;
-    lastRenderedOutputSample = { 0.0f, 0.0f };
-    renderedPlaybackWasAudible.store(false);
-    renderReady.store(false);
-    renderFailed.store(false);
-    renderMessage = "Ready to render";
+    {
+        const juce::ScopedLock lock(renderedLock);
+        renderedAudio.setSize(0, 0);
+        renderedPlaybackPosition = 0;
+        renderedPlayableSamples = 0;
+        lastRenderedOutputSample = { 0.0f, 0.0f };
+        renderedPlaybackWasAudible.store(false);
+        renderReady.store(false);
+        renderFailed.store(false);
+        renderMessage = "Ready to render";
+    }
+
+    // Pitch is a per-request inference value, not part of the loaded model.
+    // Updating it must not tear down the worker or reload CoreML/ContentVec.
+    engine.setTranspose(clamped);
 }
 
 int JkRvcAudioProcessor::getSharedSelectedModelIndex() noexcept
@@ -764,6 +874,43 @@ juce::File JkRvcAudioProcessor::findBundledRuntimeRoot()
     }
 
     return {};
+}
+
+juce::File JkRvcAudioProcessor::installStreamingWorkerScript()
+{
+    const auto runtime = findBundledRuntimeRoot();
+    if (! runtime.isDirectory())
+        return {};
+
+    const auto toolsDirectory = runtime.getChildFile("repo").getChildFile("tools");
+    if (! toolsDirectory.createDirectory())
+        return {};
+
+    const auto destination = toolsDirectory.getChildFile("rvc_stream_worker.py");
+    juce::MemoryBlock existing;
+    const auto matchesEmbeddedScript = destination.loadFileAsData(existing)
+        && existing.getSize() == (size_t) BinaryData::rvc_stream_worker_pySize
+        && std::memcmp(existing.getData(), BinaryData::rvc_stream_worker_py,
+                       (size_t) BinaryData::rvc_stream_worker_pySize) == 0;
+
+    if (! matchesEmbeddedScript
+        && ! destination.replaceWithData(BinaryData::rvc_stream_worker_py,
+                                         (size_t) BinaryData::rvc_stream_worker_pySize))
+        return {};
+
+    return destination;
+}
+
+void JkRvcAudioProcessor::configureStreamingEngine()
+{
+    const auto model = getSelectedModel();
+    RvcEngine::Configuration configuration;
+    configuration.runtimeRoot = findBundledRuntimeRoot();
+    configuration.workerScript = streamingWorkerScript;
+    configuration.modelFile = model.onnxFile;
+    configuration.indexFile = model.indexFile;
+    engine.setTranspose(pitchShiftSemitones.load());
+    engine.configure(configuration);
 }
 
 juce::File JkRvcAudioProcessor::resolveModelRoot()

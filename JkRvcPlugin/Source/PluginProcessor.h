@@ -43,7 +43,8 @@ public:
     juce::AudioProcessorValueTreeState& getState() noexcept { return state; }
     bool getLastVocalDetected() const noexcept { return lastVocalDetected.load(); }
     juce::String getEngineStatus() const { return engine.getStatusText(); }
-    bool isModelReady() const noexcept { return engine.isModelLoaded() && engine.hasGeneratedVoice(); }
+    bool isModelReady() const noexcept { return engine.isModelLoaded(); }
+    void requestModelPreload() { engine.requestPreload(); }
     int getModelCount() const noexcept { return (int) models.size(); }
     juce::String getModelName(int index) const;
     int getSelectedModelIndex() const noexcept { return selectedModelIndex.load(); }
@@ -82,6 +83,10 @@ private:
     ModelEntry getSelectedModel() const;
     juce::StringArray makeRenderArguments(const juce::File& inputFile, const juce::File& outputFile, const ModelEntry& model) const;
     static juce::File findBundledRuntimeRoot();
+    juce::File installStreamingWorkerScript();
+    void configureStreamingEngine();
+    void advancePdcDryDelay(juce::AudioBuffer<float>& buffer) noexcept;
+    void applyRvcBypassFade(juce::AudioBuffer<float>& wetBuffer, bool rvcEnabled) noexcept;
     static juce::File resolveModelRoot();
     static juce::File findFirstRecursive(const juce::File& root, const juce::String& pattern);
     static juce::File findBestIndex(const juce::File& root);
@@ -91,6 +96,7 @@ private:
     RvcEngine engine;
     std::atomic<bool> lastVocalDetected { false };
     juce::AudioFormatManager formatManager;
+    juce::File streamingWorkerScript;
 
     std::vector<ModelEntry> models;
     std::atomic<int> selectedModelIndex { 0 };
@@ -118,6 +124,13 @@ private:
     juce::String renderMessage;
 
     double currentSampleRate = 44100.0;
+    juce::AudioBuffer<float> pdcDryDelayBuffer;
+    juce::AudioBuffer<float> pdcDelayedDryBlock;
+    int pdcDryDelayPosition = 0;
+    int pdcLatencySamples = 0;
+    bool pdcTransportWasPlaying = false;
+    int bypassFadeLengthSamples = 1;
+    float bypassDryMix = 0.0f;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(JkRvcAudioProcessor)
 };
