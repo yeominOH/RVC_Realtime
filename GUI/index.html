@@ -13,13 +13,25 @@
       --coral: #e98c82;
     }
 
-    * { box-sizing: border-box; }
+    * {
+      box-sizing: border-box;
+      -webkit-user-select: none;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
     *, *::before, *::after { cursor: default !important; }
+    *::selection { color: inherit; background: transparent; }
+    img {
+      -webkit-user-drag: none;
+      user-drag: none;
+      pointer-events: none;
+    }
     html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
     body {
       color: var(--ink);
       font-family: "Avenir Next", Avenir, Optima, "Gill Sans", sans-serif;
       -webkit-font-smoothing: antialiased;
+      -webkit-user-select: none;
       user-select: none;
       background: #faf6ee;
     }
@@ -83,6 +95,7 @@
       touch-action: none;
       outline: none;
     }
+    .slider-shell.disabled { opacity: .48; pointer-events: none; }
 
     .slider-track {
       position: absolute;
@@ -184,8 +197,8 @@
 
     .status-card {
       width: 132px;
-      min-height: 86px;
-      margin-top: 22px;
+      min-height: 92px;
+      margin-top: 14px;
       padding: 12px 11px;
       border-top: 1px solid var(--line);
       border-bottom: 1px solid var(--line);
@@ -204,25 +217,30 @@
     }
     .status-dot.live { background: #68bca9; box-shadow: 0 0 0 3px rgba(104,188,169,.13); }
 
-    .stream-card {
-      width: 132px;
-      min-height: 118px;
-      padding: 16px 11px;
-      border-top: 1px solid var(--line);
-      border-bottom: 1px solid var(--line);
-      background: rgba(255,252,246,.32);
-      color: var(--muted);
-      font-size: 9.5px;
-      line-height: 1.55;
-    }
-    .stream-title {
-      margin-bottom: 10px;
+    .status-title {
+      margin-bottom: 7px;
       color: var(--ink);
       font-size: 11px;
       font-weight: 600;
       letter-spacing: .08em;
     }
-    .stream-hint { margin-top: 12px; opacity: .78; }
+    .status-line { min-height: 15px; }
+    .progress-shell {
+      width: 100%;
+      height: 3px;
+      margin-top: 9px;
+      overflow: hidden;
+      border-radius: 2px;
+      background: rgba(79,49,92,.11);
+    }
+    .progress-fill {
+      width: 0;
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #8e71d5, #e88c83);
+      transition: width .18s ease;
+    }
+    .session-hint { margin-top: 9px; opacity: .76; }
 
     .bottom-bar {
       position: absolute;
@@ -330,11 +348,16 @@
         <path class="wave" stroke="#db8b83" d="M1 8 C8 3, 15 11, 22 5 S35 2, 42 7 S52 9, 61 4"/>
         <path class="wave" stroke="#e8bd67" opacity=".8" d="M35 7 C43 3, 52 8, 61 5"/>
       </svg>
-      <div class="control-label">Live conversion</div>
-      <div class="stream-card">
-        <div class="stream-title"><span id="statusDot" class="status-dot"></span>STREAM</div>
-        <div id="streamStatus">Loading RVC model</div>
-        <div class="stream-hint">Turn RVC on, then press play in your DAW.</div>
+      <div class="control-label">Track audio</div>
+      <button id="captureButton" class="action" type="button">CAPTURE</button>
+      <div class="control-label">Voice conversion</div>
+      <button id="transformButton" class="action" type="button" disabled>TRANSFORM</button>
+      <div class="status-card">
+        <div class="status-title"><span id="statusDot" class="status-dot"></span>SESSION</div>
+        <div id="captureStatus" class="status-line">Capture idle</div>
+        <div id="renderStatus" class="status-line">Waiting for capture</div>
+        <div class="progress-shell"><div id="renderProgress" class="progress-fill"></div></div>
+        <div id="sessionHint" class="session-hint">Arm capture, then press play in your DAW.</div>
       </div>
     </section>
 
@@ -356,6 +379,12 @@
       const ticks = document.getElementById('ticks');
       const modelSelect = document.getElementById('modelSelect');
       const bypassButton = document.getElementById('bypassButton');
+      const captureButton = document.getElementById('captureButton');
+      const transformButton = document.getElementById('transformButton');
+      const captureStatus = document.getElementById('captureStatus');
+      const renderStatus = document.getElementById('renderStatus');
+      const renderProgress = document.getElementById('renderProgress');
+      const sessionHint = document.getElementById('sessionHint');
       let pitch = 0;
       let dragging = false;
       let modelSignature = '';
@@ -367,6 +396,24 @@
       const releaseKeyboardFocus = () => {
         if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
         send('releaseKeyboardFocus');
+      };
+
+      const releaseKeyboardFocusSoon = () => {
+        window.setTimeout(releaseKeyboardFocus, 0);
+      };
+
+      const bindImmediateButton = (button, action) => {
+        button.addEventListener('pointerdown', event => {
+          if (button.disabled || !event.isPrimary || event.button !== 0) return;
+          event.preventDefault();
+          event.stopPropagation();
+          action();
+          releaseKeyboardFocusSoon();
+        });
+
+        // pointerdown already performs the action. Suppress the synthetic click
+        // so WebKit cannot deliver the same command a second time.
+        button.addEventListener('click', event => event.preventDefault());
       };
 
       const resize = () => {
@@ -415,29 +462,52 @@
       slider.addEventListener('pointermove', event => {
         if (dragging) setPitch(pitchFromPointer(event), true);
       });
-      slider.addEventListener('pointerup', () => { dragging = false; });
-      slider.addEventListener('pointercancel', () => { dragging = false; });
+      slider.addEventListener('pointerup', () => {
+        dragging = false;
+        releaseKeyboardFocusSoon();
+      });
+      slider.addEventListener('pointercancel', () => {
+        dragging = false;
+        releaseKeyboardFocusSoon();
+      });
 
       modelSelect.addEventListener('change', () => {
         send('selectModel', Number(modelSelect.value));
-        releaseKeyboardFocus();
-      });
-      bypassButton.addEventListener('click', () => {
-        send('togglePower', !bypassButton.classList.contains('on'));
-        releaseKeyboardFocus();
+        releaseKeyboardFocusSoon();
       });
 
-      window.addEventListener('pointerup', event => {
-        if (event.target !== modelSelect) releaseKeyboardFocus();
-      }, true);
+      bindImmediateButton(bypassButton, () => {
+        send('togglePower', !bypassButton.classList.contains('on'));
+      });
+      bindImmediateButton(captureButton, () => send('toggleCapture'));
+      bindImmediateButton(transformButton, () => send('toggleTransform'));
 
       const updateState = state => {
         if (!dragging) setPitch(Number(state.pitch || 0));
         bypassButton.classList.toggle('on', Boolean(state.enabled));
         bypassButton.textContent = state.enabled ? 'RVC ON' : 'BYPASS';
-        document.getElementById('streamStatus').textContent = state.engineStatus || 'Streaming engine idle';
-        document.getElementById('statusDot').classList.toggle('live', Boolean(state.enabled && (state.modelLoaded || state.vocalDetected)));
-        document.getElementById('renderBadge').textContent = state.engineStatus || 'RVC READY';
+        const capturing = Boolean(state.capturing);
+        const rendering = Boolean(state.rendering);
+        const hasCapture = Boolean(state.hasCapture);
+        const hasRender = Boolean(state.hasRender);
+        captureButton.classList.toggle('active', capturing);
+        captureButton.textContent = capturing ? 'STOP CAPTURE' : (hasCapture ? 'CAPTURE AGAIN' : 'CAPTURE');
+        captureButton.disabled = rendering;
+        transformButton.classList.toggle('active', rendering);
+        transformButton.textContent = rendering ? 'CANCEL' : (hasRender ? 'TRANSFORM AGAIN' : 'TRANSFORM');
+        transformButton.disabled = !rendering && (!hasCapture || capturing);
+        transformButton.dataset.cancel = rendering ? 'true' : 'false';
+        captureStatus.textContent = state.captureStatus || 'Capture idle';
+        renderStatus.textContent = state.renderStatus || 'Waiting for capture';
+        renderProgress.style.width = `${Math.max(0, Math.min(1, Number(state.renderProgress || 0))) * 100}%`;
+        document.getElementById('statusDot').classList.toggle('live', Boolean(hasRender && state.enabled));
+        document.getElementById('renderBadge').textContent = hasRender ? 'TRANSFORM READY' : (state.renderStatus || 'CAPTURE MODE');
+        sessionHint.textContent = capturing
+          ? (hasCapture ? 'Play the complete section, then stop your DAW.' : 'Press play in your DAW to begin capture.')
+          : (hasRender ? 'Replay the same timeline section to hear the transformed voice.'
+                       : (hasCapture ? 'Choose a model and press Transform.' : 'Arm capture, then press play in your DAW.'));
+        modelSelect.disabled = rendering;
+        slider.classList.toggle('disabled', rendering);
 
         const signature = JSON.stringify(state.models || []);
         if (signature !== modelSignature) {
@@ -459,6 +529,8 @@
       };
 
       window.addEventListener('resize', resize);
+      window.addEventListener('selectstart', event => event.preventDefault());
+      window.addEventListener('dragstart', event => event.preventDefault());
       resize();
       setPitch(0);
       if (window.__JUCE__?.backend) {

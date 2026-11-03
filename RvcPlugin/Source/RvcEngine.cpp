@@ -776,7 +776,7 @@ juce::StringArray RvcEngine::makeWorkerArguments(const Configuration& config) co
     args.add("--shared-memory");
     args.add(sharedMemoryFile.getFullPathName());
     args.add("--renderer");
-    args.add(repo.getChildFile("tools").getChildFile("jk_offline_render.py").getFullPathName());
+    args.add(repo.getChildFile("tools").getChildFile("rvc_offline_render.py").getFullPathName());
     args.add("--rvc-model");
     args.add(config.modelFile.getFullPathName());
     args.add("--vec-model");

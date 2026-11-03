@@ -6,16 +6,17 @@
 #include "RvcEngine.h"
 
 #include <array>
+#include <memory>
 #include <vector>
 
-class JkRvcAudioProcessor final : public juce::AudioProcessor
+class RvcAudioProcessor final : public juce::AudioProcessor
 #if JucePlugin_Enable_ARA
                              , public juce::AudioProcessorARAExtension
 #endif
 {
 public:
-    JkRvcAudioProcessor();
-    ~JkRvcAudioProcessor() override = default;
+    RvcAudioProcessor();
+    ~RvcAudioProcessor() override;
 
     void prepareToPlay(double sampleRate, int samplesPerBlock) override;
     void releaseResources() override;
@@ -58,8 +59,10 @@ public:
     bool hasCapturedAudio() const noexcept { return capturedSamplesAtomic.load() > 0; }
     double getCapturedSeconds() const noexcept;
     void startManualRender();
+    void cancelManualRender();
     bool isRendering() const noexcept { return renderInProgress.load(); }
     bool hasRenderedAudio() const noexcept { return renderReady.load(); }
+    float getRenderProgress() const noexcept { return renderProgress.load(); }
     juce::String getCaptureStatus() const;
     juce::String getRenderStatus() const;
 
@@ -75,6 +78,7 @@ private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameters();
     void loadModelChoices();
     void appendInputToCaptureBuffer(const juce::AudioBuffer<float>& buffer);
+    void invalidateRenderedAudio(const juce::String& nextMessage);
     bool playRenderedAudioForCurrentPosition(juce::AudioBuffer<float>& buffer);
     void cutRenderedPlaybackToSilence(juce::AudioBuffer<float>& buffer);
     int findCapturedAudioEndSample(const juce::AudioBuffer<float>& audio, int numSamples) const;
@@ -109,7 +113,9 @@ private:
     int capturedSamples = 0;
     std::atomic<int> capturedSamplesAtomic { 0 };
     std::atomic<bool> captureActive { false };
+    std::atomic<bool> captureStarted { false };
     std::atomic<bool> captureOverflowed { false };
+    std::atomic<bool> captureDiscontinuity { false };
     std::atomic<juce::int64> captureStartHostSample { -1 };
 
     mutable juce::CriticalSection renderedLock;
@@ -121,6 +127,11 @@ private:
     std::atomic<bool> renderInProgress { false };
     std::atomic<bool> renderReady { false };
     std::atomic<bool> renderFailed { false };
+    std::atomic<bool> renderCancelRequested { false };
+    std::atomic<float> renderProgress { 0.0f };
+    std::atomic<int> renderGeneration { 0 };
+    mutable juce::CriticalSection renderProcessLock;
+    std::shared_ptr<juce::ChildProcess> activeRenderProcess;
     juce::String renderMessage;
 
     double currentSampleRate = 44100.0;
@@ -132,5 +143,5 @@ private:
     int bypassFadeLengthSamples = 1;
     float bypassDryMix = 0.0f;
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(JkRvcAudioProcessor)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(RvcAudioProcessor)
 };

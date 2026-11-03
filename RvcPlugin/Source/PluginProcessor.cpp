@@ -5,15 +5,16 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #if JUCE_MAC
 #include <dlfcn.h>
 #endif
 
-std::atomic<int> JkRvcAudioProcessor::sharedSelectedModelIndex { 0 };
+std::atomic<int> RvcAudioProcessor::sharedSelectedModelIndex { 0 };
 
-JkRvcAudioProcessor::JkRvcAudioProcessor()
+RvcAudioProcessor::RvcAudioProcessor()
     : AudioProcessor(BusesProperties()
                          .withInput("Input", juce::AudioChannelSet::stereo(), true)
                          .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
@@ -21,11 +22,17 @@ JkRvcAudioProcessor::JkRvcAudioProcessor()
 {
     formatManager.registerBasicFormats();
     loadModelChoices();
-    streamingWorkerScript = installStreamingWorkerScript();
-    configureStreamingEngine();
+    renderMessage = "Waiting for capture";
 }
 
-juce::AudioProcessorValueTreeState::ParameterLayout JkRvcAudioProcessor::createParameters()
+RvcAudioProcessor::~RvcAudioProcessor()
+{
+    cancelManualRender();
+    for (int i = 0; i < 500 && renderInProgress.load(); ++i)
+        juce::Thread::sleep(10);
+}
+
+juce::AudioProcessorValueTreeState::ParameterLayout RvcAudioProcessor::createParameters()
 {
     std::vector<std::unique_ptr<juce::RangedAudioParameter>> params;
 
@@ -37,21 +44,16 @@ juce::AudioProcessorValueTreeState::ParameterLayout JkRvcAudioProcessor::createP
     return { params.begin(), params.end() };
 }
 
-void JkRvcAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
+void RvcAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
     currentSampleRate = sampleRate > 0.0 ? sampleRate : 44100.0;
 
-    configureStreamingEngine();
-    engine.prepare(sampleRate, samplesPerBlock);
-    // The streaming engine intentionally emits a fixed amount of leading
-    // silence while the first RVC block is being converted.  Report that
-    // exact contract to the host so prerecorded tracks are aligned by the
-    // DAW's plug-in delay compensation instead of sounding late.
-    setLatencySamples(engine.getLatencySamples());
-
-    pdcLatencySamples = engine.getLatencySamples();
+    // Captured audio is rendered before playback, so this mode has no
+    // algorithmic playback latency and does not require DAW PDC.
+    setLatencySamples(0);
+    pdcLatencySamples = 0;
     pdcDryDelayBuffer.setSize(juce::jmax(1, getTotalNumInputChannels()),
-                              juce::jmax(1, pdcLatencySamples), false, true, true);
+                              1, false, true, true);
     pdcDryDelayBuffer.clear();
     pdcDelayedDryBlock.setSize(juce::jmax(1, getTotalNumOutputChannels()),
                                juce::jmax(1, samplesPerBlock), false, true, true);
@@ -68,25 +70,33 @@ void JkRvcAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
         captureBuffer.clear();
         capturedSamples = 0;
         capturedSamplesAtomic.store(0);
+        captureStarted.store(false);
         captureStartHostSample.store(-1);
         captureOverflowed.store(false);
+        captureDiscontinuity.store(false);
     }
 
     {
         const juce::ScopedLock lock(renderedLock);
+        renderedAudio.setSize(0, 0);
         renderedPlaybackPosition = 0;
         renderedPlayableSamples = 0;
         lastRenderedOutputSample = { 0.0f, 0.0f };
         renderedPlaybackWasAudible.store(false);
+        renderReady.store(false);
+        renderFailed.store(false);
+        renderProgress.store(0.0f);
+        renderMessage = "Waiting for capture";
     }
 }
 
-void JkRvcAudioProcessor::releaseResources()
+void RvcAudioProcessor::releaseResources()
 {
-    engine.reset();
+    captureActive.store(false);
+    renderedPlaybackWasAudible.store(false);
 }
 
-bool JkRvcAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
+bool RvcAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
 {
     const auto& input = layouts.getMainInputChannelSet();
     const auto& output = layouts.getMainOutputChannelSet();
@@ -94,27 +104,24 @@ bool JkRvcAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) con
     return input == output && (output == juce::AudioChannelSet::mono() || output == juce::AudioChannelSet::stereo());
 }
 
-void JkRvcAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+void RvcAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
     juce::ScopedNoDenormals noDenormals;
 
     const auto enabled = state.getRawParameterValue("rvcEnabled")->load() > 0.5f;
 
-    // Keep the converter running while the UI is bypassed.  This makes a
-    // mid-playback return to RVC instantaneous and keeps the wet and delayed
-    // dry paths on the same continuous timeline.
-    engine.setEnabled(true);
-
-    const auto vocalDetected = engine.detectVocal(buffer);
-    lastVocalDetected.store(vocalDetected);
+    lastVocalDetected.store(false);
 
     auto isPlaying = true;
     if (auto* playHead = getPlayHead())
         isPlaying = playHead->getPosition()->getIsPlaying();
-    engine.setTransportPlaying(isPlaying);
-
     if (captureActive.load())
-        appendInputToCaptureBuffer(buffer);
+    {
+        if (isPlaying)
+            appendInputToCaptureBuffer(buffer);
+        else if (captureStarted.load())
+            stopCapture();
+    }
 
     if (! isPlaying)
     {
@@ -125,6 +132,7 @@ void JkRvcAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
             pdcDryDelayPosition = 0;
         }
         pdcTransportWasPlaying = false;
+        renderedPlaybackWasAudible.store(false);
         return;
     }
 
@@ -136,17 +144,16 @@ void JkRvcAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
         pdcTransportWasPlaying = true;
     }
 
-    // Capture the PDC-aligned dry signal before the engine replaces the
-    // buffer with converted audio.
+    // Keep an untouched dry copy for click-free RVC ON/BYPASS fades.
     advancePdcDryDelay(buffer);
 
-    if (isPlaying)
-        engine.process(buffer);
+    if (enabled && renderReady.load())
+        playRenderedAudioForCurrentPosition(buffer);
 
     applyRvcBypassFade(buffer, enabled);
 }
 
-void JkRvcAudioProcessor::advancePdcDryDelay(juce::AudioBuffer<float>& buffer) noexcept
+void RvcAudioProcessor::advancePdcDryDelay(juce::AudioBuffer<float>& buffer) noexcept
 {
     const auto channels = buffer.getNumChannels();
     const auto samples = buffer.getNumSamples();
@@ -180,7 +187,7 @@ void JkRvcAudioProcessor::advancePdcDryDelay(juce::AudioBuffer<float>& buffer) n
     }
 }
 
-void JkRvcAudioProcessor::applyRvcBypassFade(juce::AudioBuffer<float>& wetBuffer,
+void RvcAudioProcessor::applyRvcBypassFade(juce::AudioBuffer<float>& wetBuffer,
                                               bool rvcEnabled) noexcept
 {
     const auto channels = juce::jmin(wetBuffer.getNumChannels(), pdcDelayedDryBlock.getNumChannels());
@@ -212,19 +219,29 @@ void JkRvcAudioProcessor::applyRvcBypassFade(juce::AudioBuffer<float>& wetBuffer
         wetBuffer.clear(samples, wetBuffer.getNumSamples() - samples);
 }
 
-void JkRvcAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
+void RvcAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
-    if (auto xml = state.copyState().createXml())
+    auto snapshot = state.copyState();
+    snapshot.setProperty("selectedModelIndex", selectedModelIndex.load(), nullptr);
+    snapshot.setProperty("pitchShiftSemitones", pitchShiftSemitones.load(), nullptr);
+    if (auto xml = snapshot.createXml())
         copyXmlToBinary(*xml, destData);
 }
 
-void JkRvcAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
+void RvcAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
 {
     if (auto xml = getXmlFromBinary(data, sizeInBytes))
-        state.replaceState(juce::ValueTree::fromXml(*xml));
+    {
+        auto restored = juce::ValueTree::fromXml(*xml);
+        const auto restoredModel = (int) restored.getProperty("selectedModelIndex", 0);
+        const auto restoredPitch = (int) restored.getProperty("pitchShiftSemitones", 0);
+        state.replaceState(restored);
+        setSelectedModelIndex(restoredModel);
+        setPitchShiftSemitones(restoredPitch);
+    }
 }
 
-double JkRvcAudioProcessor::getTailLengthSeconds() const
+double RvcAudioProcessor::getTailLengthSeconds() const
 {
 #if JucePlugin_Enable_ARA
     double tailLength = 0.0;
@@ -235,7 +252,7 @@ double JkRvcAudioProcessor::getTailLengthSeconds() const
     return 0.0;
 }
 
-juce::String JkRvcAudioProcessor::getModelName(int index) const
+juce::String RvcAudioProcessor::getModelName(int index) const
 {
     if (index >= 0 && index < (int) models.size())
         return models[(size_t) index].name;
@@ -243,69 +260,54 @@ juce::String JkRvcAudioProcessor::getModelName(int index) const
     return {};
 }
 
-void JkRvcAudioProcessor::setSelectedModelIndex(int index)
+void RvcAudioProcessor::setSelectedModelIndex(int index)
 {
     if (index < 0 || index >= (int) models.size())
         return;
 
     selectedModelIndex.store(index);
     sharedSelectedModelIndex.store(index);
-
-    const juce::ScopedLock lock(renderedLock);
-    renderedAudio.setSize(0, 0);
-    renderedPlaybackPosition = 0;
-    renderedPlayableSamples = 0;
-    lastRenderedOutputSample = { 0.0f, 0.0f };
-    renderedPlaybackWasAudible.store(false);
-    renderReady.store(false);
-    renderFailed.store(false);
-    renderMessage = "Ready to render";
-    configureStreamingEngine();
-    engine.requestPreload();
+    if (renderInProgress.load())
+        cancelManualRender();
+    invalidateRenderedAudio(hasCapturedAudio() ? "Model changed - transform again"
+                                               : "Waiting for capture");
 }
 
-void JkRvcAudioProcessor::setPitchShiftSemitones(int semitones)
+void RvcAudioProcessor::setPitchShiftSemitones(int semitones)
 {
     const auto clamped = juce::jlimit(-24, 24, semitones);
     if (pitchShiftSemitones.exchange(clamped) == clamped)
         return;
 
-    {
-        const juce::ScopedLock lock(renderedLock);
-        renderedAudio.setSize(0, 0);
-        renderedPlaybackPosition = 0;
-        renderedPlayableSamples = 0;
-        lastRenderedOutputSample = { 0.0f, 0.0f };
-        renderedPlaybackWasAudible.store(false);
-        renderReady.store(false);
-        renderFailed.store(false);
-        renderMessage = "Ready to render";
-    }
-
-    // Pitch is a per-request inference value, not part of the loaded model.
-    // Updating it must not tear down the worker or reload CoreML/ContentVec.
-    engine.setTranspose(clamped);
+    if (renderInProgress.load())
+        cancelManualRender();
+    invalidateRenderedAudio(hasCapturedAudio() ? "Pitch changed - transform again"
+                                               : "Waiting for capture");
 }
 
-int JkRvcAudioProcessor::getSharedSelectedModelIndex() noexcept
+int RvcAudioProcessor::getSharedSelectedModelIndex() noexcept
 {
     return sharedSelectedModelIndex.load();
 }
 
-double JkRvcAudioProcessor::getCapturedSeconds() const noexcept
+double RvcAudioProcessor::getCapturedSeconds() const noexcept
 {
     return (double) capturedSamplesAtomic.load() / juce::jmax(1.0, currentSampleRate);
 }
 
-juce::String JkRvcAudioProcessor::getCaptureStatus() const
+juce::String RvcAudioProcessor::getCaptureStatus() const
 {
     const auto seconds = getCapturedSeconds();
 
     if (captureActive.load())
-        return "Capturing " + juce::String(seconds, 1) + "s";
+        return captureStarted.load() ? "Capturing " + juce::String(seconds, 1) + "s"
+                                     : "Capture armed - press play";
 
     if (captureOverflowed.load())
         return "Capture full at " + juce::String(seconds, 1) + "s";
+
+    if (captureDiscontinuity.load())
+        return "Captured " + juce::String(seconds, 1) + "s - stopped at timeline jump";
 
     if (capturedSamplesAtomic.load() > 0)
         return "Captured " + juce::String(seconds, 1) + "s";
@@ -313,48 +315,64 @@ juce::String JkRvcAudioProcessor::getCaptureStatus() const
     return "Capture idle";
 }
 
-void JkRvcAudioProcessor::startCapture()
+void RvcAudioProcessor::startCapture()
 {
+    if (renderInProgress.load())
+        cancelManualRender();
+
     const juce::ScopedLock lock(captureLock);
     captureBuffer.clear();
     capturedSamples = 0;
     capturedSamplesAtomic.store(0);
+    captureStarted.store(false);
     captureStartHostSample.store(-1);
     captureOverflowed.store(false);
+    captureDiscontinuity.store(false);
     captureActive.store(true);
-
-    const juce::ScopedLock rendered(renderedLock);
-    renderedAudio.setSize(0, 0);
-    renderedPlaybackPosition = 0;
-    renderedPlayableSamples = 0;
-    lastRenderedOutputSample = { 0.0f, 0.0f };
-    renderedPlaybackWasAudible.store(false);
-    renderReady.store(false);
-    renderFailed.store(false);
-    renderMessage = "Capturing";
+    invalidateRenderedAudio("Capture armed - press play");
 }
 
-void JkRvcAudioProcessor::stopCapture()
+void RvcAudioProcessor::stopCapture()
 {
     captureActive.store(false);
+    if (capturedSamplesAtomic.load() > 0)
+    {
+        const juce::ScopedLock lock(renderedLock);
+        renderMessage = "Ready to transform";
+    }
 }
 
-void JkRvcAudioProcessor::appendInputToCaptureBuffer(const juce::AudioBuffer<float>& buffer)
+void RvcAudioProcessor::appendInputToCaptureBuffer(const juce::AudioBuffer<float>& buffer)
 {
     const juce::ScopedTryLock lock(captureLock);
     if (! lock.isLocked() || captureCapacitySamples <= 0)
         return;
 
+    auto hostSample = (juce::int64) -1;
+    if (auto* playHead = getPlayHead())
+        hostSample = playHead->getPosition()->getTimeInSamples().orFallback((juce::int64) -1);
+
     if (captureStartHostSample.load() < 0)
     {
-        if (auto* playHead = getPlayHead())
-            captureStartHostSample.store(playHead->getPosition()->getTimeInSamples().orFallback(-1));
+        captureStartHostSample.store(hostSample);
+    }
+    else if (hostSample >= 0)
+    {
+        const auto expected = captureStartHostSample.load() + capturedSamples;
+        const auto tolerance = juce::jmax(2, buffer.getNumSamples() * 2);
+        if (std::llabs(hostSample - expected) > tolerance)
+        {
+            captureDiscontinuity.store(true);
+            captureActive.store(false);
+            return;
+        }
     }
 
     const auto writable = juce::jmin(buffer.getNumSamples(), captureCapacitySamples - capturedSamples);
     if (writable <= 0)
     {
         captureOverflowed.store(true);
+        captureActive.store(false);
         return;
     }
 
@@ -364,12 +382,31 @@ void JkRvcAudioProcessor::appendInputToCaptureBuffer(const juce::AudioBuffer<flo
 
     capturedSamples += writable;
     capturedSamplesAtomic.store(capturedSamples);
+    captureStarted.store(capturedSamples > 0);
 
     if (writable < buffer.getNumSamples())
+    {
         captureOverflowed.store(true);
+        captureActive.store(false);
+    }
 }
 
-bool JkRvcAudioProcessor::playRenderedAudioForCurrentPosition(juce::AudioBuffer<float>& buffer)
+void RvcAudioProcessor::invalidateRenderedAudio(const juce::String& nextMessage)
+{
+    renderGeneration.fetch_add(1);
+    const juce::ScopedLock lock(renderedLock);
+    renderedAudio.setSize(0, 0);
+    renderedPlaybackPosition = 0;
+    renderedPlayableSamples = 0;
+    lastRenderedOutputSample = { 0.0f, 0.0f };
+    renderedPlaybackWasAudible.store(false);
+    renderReady.store(false);
+    renderFailed.store(false);
+    renderProgress.store(0.0f);
+    renderMessage = nextMessage;
+}
+
+bool RvcAudioProcessor::playRenderedAudioForCurrentPosition(juce::AudioBuffer<float>& buffer)
 {
     if (! renderReady.load())
         return false;
@@ -392,7 +429,10 @@ bool JkRvcAudioProcessor::playRenderedAudioForCurrentPosition(juce::AudioBuffer<
     }
 
     if (sourceStart < 0 || sourceStart >= playableSamples)
+    {
+        renderedPlaybackWasAudible.store(false);
         return false;
+    }
 
     const auto readable = juce::jmin(buffer.getNumSamples(), playableSamples - sourceStart);
     if (readable <= 0)
@@ -440,7 +480,7 @@ bool JkRvcAudioProcessor::playRenderedAudioForCurrentPosition(juce::AudioBuffer<
     return true;
 }
 
-void JkRvcAudioProcessor::cutRenderedPlaybackToSilence(juce::AudioBuffer<float>& buffer)
+void RvcAudioProcessor::cutRenderedPlaybackToSilence(juce::AudioBuffer<float>& buffer)
 {
     const auto shouldRamp = renderedPlaybackWasAudible.exchange(false);
     buffer.clear();
@@ -463,7 +503,7 @@ void JkRvcAudioProcessor::cutRenderedPlaybackToSilence(juce::AudioBuffer<float>&
     }
 }
 
-int JkRvcAudioProcessor::findCapturedAudioEndSample(const juce::AudioBuffer<float>& audio, int numSamples) const
+int RvcAudioProcessor::findCapturedAudioEndSample(const juce::AudioBuffer<float>& audio, int numSamples) const
 {
     const auto boundedSamples = juce::jlimit(0, audio.getNumSamples(), numSamples);
     if (boundedSamples <= 0 || audio.getNumChannels() <= 0)
@@ -503,15 +543,12 @@ int JkRvcAudioProcessor::findCapturedAudioEndSample(const juce::AudioBuffer<floa
     return juce::jlimit(0, boundedSamples, lastActiveSample + releaseSamples);
 }
 
-juce::String JkRvcAudioProcessor::getRenderStatus() const
+juce::String RvcAudioProcessor::getRenderStatus() const
 {
-    if (renderInProgress.load())
-        return "Rendering captured audio";
-
     const juce::ScopedLock lock(renderedLock);
 
     if (renderReady.load())
-        return "Render ready";
+        return "Transform ready - press play";
 
     if (renderFailed.load())
         return renderMessage;
@@ -519,16 +556,17 @@ juce::String JkRvcAudioProcessor::getRenderStatus() const
     if (renderMessage.isNotEmpty())
         return renderMessage;
 
-    return capturedSamplesAtomic.load() > 0 ? "Ready to render" : "Waiting for capture";
+    return capturedSamplesAtomic.load() > 0 ? "Ready to transform" : "Waiting for capture";
 }
 
-void JkRvcAudioProcessor::startManualRender()
+void RvcAudioProcessor::startManualRender()
 {
-    if (renderInProgress.load())
+    if (renderInProgress.exchange(true))
         return;
 
     if (models.empty())
     {
+        renderInProgress.store(false);
         renderFailed.store(true);
         renderMessage = "No models found";
         return;
@@ -552,6 +590,7 @@ void JkRvcAudioProcessor::startManualRender()
 
     if (samplesToRender <= 0)
     {
+        renderInProgress.store(false);
         renderFailed.store(true);
         renderMessage = "Nothing captured";
         return;
@@ -560,15 +599,21 @@ void JkRvcAudioProcessor::startManualRender()
     const auto model = getSelectedModel();
     if (! model.onnxFile.existsAsFile())
     {
+        renderInProgress.store(false);
         renderFailed.store(true);
         renderMessage = "Selected model missing";
         return;
     }
 
-    renderInProgress.store(true);
+    const auto generation = renderGeneration.fetch_add(1) + 1;
+    renderCancelRequested.store(false);
     renderFailed.store(false);
     renderReady.store(false);
-    renderMessage = "Rendering captured audio";
+    renderProgress.store(0.03f);
+    {
+        const juce::ScopedLock lock(renderedLock);
+        renderMessage = "Preparing captured audio...";
+    }
 
     const auto inputFile = writeBufferToTempFile(captured, samplesToRender, "rvc_capture");
     if (! inputFile.existsAsFile())
@@ -583,59 +628,167 @@ void JkRvcAudioProcessor::startManualRender()
     const auto args = makeRenderArguments(inputFile, outputFile, model);
     auto* processor = this;
 
-    juce::Thread::launch([processor, args, outputFile, playableSamplesToRender]
+    const auto launched = juce::Thread::launch([processor, args, inputFile, outputFile,
+                                                 playableSamplesToRender, generation]
     {
         bool ok = false;
         juce::String processOutput;
-        juce::ChildProcess process;
-
-        if (process.start(args))
+        auto process = std::make_shared<juce::ChildProcess>();
         {
-            while (process.isRunning())
+            const juce::ScopedLock lock(processor->renderProcessLock);
+            processor->activeRenderProcess = process;
+        }
+
+        auto consumeProcessOutput = [&]
+        {
+            const auto fresh = process->readAllProcessOutput();
+            if (fresh.isEmpty())
+                return;
+
+            processOutput += fresh;
+            juce::StringArray lines;
+            lines.addLines(fresh);
+            for (const auto& rawLine : lines)
             {
-                processOutput += process.readAllProcessOutput();
-                juce::Thread::sleep(100);
+                const auto line = rawLine.trim();
+                if (! line.startsWith("Rendering "))
+                    continue;
+
+                const auto timing = line.fromFirstOccurrenceOf("Rendering ", false, false);
+                const auto completedText = timing.upToFirstOccurrenceOf("s / ", false, false);
+                const auto totalText = timing.fromFirstOccurrenceOf("s / ", false, false)
+                                             .upToFirstOccurrenceOf("s", false, false);
+                const auto completed = completedText.getDoubleValue();
+                const auto total = totalText.getDoubleValue();
+                if (total <= 0.0)
+                    continue;
+
+                const auto progress = (float) juce::jlimit(0.08, 0.94,
+                    0.08 + 0.86 * (completed / total));
+                processor->renderProgress.store(progress);
+                const juce::ScopedLock lock(processor->renderedLock);
+                processor->renderMessage = "Transforming voice... "
+                                         + juce::String((int) std::round(progress * 100.0f)) + "%";
+            }
+        };
+
+        if (! processor->renderCancelRequested.load() && process->start(args))
+        {
+            {
+                const juce::ScopedLock lock(processor->renderedLock);
+                processor->renderMessage = "Loading model and analyzing audio...";
+            }
+            processor->renderProgress.store(0.08f);
+
+            while (process->isRunning() && ! processor->renderCancelRequested.load())
+            {
+                consumeProcessOutput();
+                juce::Thread::sleep(50);
             }
 
-            processOutput += process.readAllProcessOutput();
-            ok = process.getExitCode() == 0 && outputFile.existsAsFile();
+            if (processor->renderCancelRequested.load() && process->isRunning())
+                process->kill();
+
+            consumeProcessOutput();
+            ok = ! processor->renderCancelRequested.load()
+              && process->getExitCode() == 0
+              && outputFile.existsAsFile();
         }
 
         juce::AudioBuffer<float> loaded;
         if (ok)
+        {
+            processor->renderProgress.store(0.97f);
+            {
+                const juce::ScopedLock lock(processor->renderedLock);
+                processor->renderMessage = "Finalizing transformed audio...";
+            }
             ok = processor->loadRenderedFile(outputFile, loaded);
+        }
 
+        const auto currentGeneration = processor->renderGeneration.load() == generation;
         {
             const juce::ScopedLock lock(processor->renderedLock);
-            if (ok)
+            if (currentGeneration && ok)
             {
                 processor->renderedAudio = std::move(loaded);
                 processor->renderedPlaybackPosition = 0;
-                processor->renderedPlayableSamples = playableSamplesToRender;
+                processor->renderedPlayableSamples = juce::jmin(playableSamplesToRender,
+                                                                 processor->renderedAudio.getNumSamples());
                 processor->lastRenderedOutputSample = { 0.0f, 0.0f };
                 processor->renderedPlaybackWasAudible.store(false);
-                processor->renderMessage = "Render ready";
+                processor->renderMessage = "Transform ready - press play";
                 processor->renderReady.store(true);
                 processor->renderFailed.store(false);
+                processor->renderProgress.store(1.0f);
             }
-            else
+            else if (currentGeneration)
             {
                 processor->renderedAudio.setSize(0, 0);
                 processor->renderedPlaybackPosition = 0;
                 processor->renderedPlayableSamples = 0;
                 processor->lastRenderedOutputSample = { 0.0f, 0.0f };
                 processor->renderedPlaybackWasAudible.store(false);
-                processor->renderMessage = processOutput.isNotEmpty() ? processOutput.substring(0, 240) : "Render failed";
+                const auto cancelled = processor->renderCancelRequested.load();
+                const auto errorStart = juce::jmax(0, processOutput.length() - 240);
+                processor->renderMessage = cancelled ? "Transform cancelled"
+                    : (processOutput.isNotEmpty() ? processOutput.substring(errorStart) : "Transform failed");
                 processor->renderReady.store(false);
-                processor->renderFailed.store(true);
+                processor->renderFailed.store(! cancelled);
+                processor->renderProgress.store(0.0f);
+            }
+            else if (! currentGeneration && processor->renderCancelRequested.load()
+                     && processor->renderMessage == "Cancelling transform...")
+            {
+                processor->renderMessage = "Transform cancelled";
+                processor->renderProgress.store(0.0f);
             }
         }
 
+        {
+            const juce::ScopedLock lock(processor->renderProcessLock);
+            if (processor->activeRenderProcess == process)
+                processor->activeRenderProcess.reset();
+        }
+
+        inputFile.deleteFile();
+        outputFile.deleteFile();
         processor->renderInProgress.store(false);
     });
+
+    if (! launched)
+    {
+        inputFile.deleteFile();
+        renderInProgress.store(false);
+        renderFailed.store(true);
+        renderProgress.store(0.0f);
+        const juce::ScopedLock lock(renderedLock);
+        renderMessage = "Could not start transform worker";
+    }
 }
 
-juce::File JkRvcAudioProcessor::writeBufferToTempFile(const juce::AudioBuffer<float>& audio,
+void RvcAudioProcessor::cancelManualRender()
+{
+    if (! renderInProgress.load())
+        return;
+
+    renderCancelRequested.store(true);
+    renderGeneration.fetch_add(1);
+    {
+        const juce::ScopedLock lock(renderedLock);
+        renderMessage = "Cancelling transform...";
+    }
+
+    std::shared_ptr<juce::ChildProcess> process;
+    {
+        const juce::ScopedLock lock(renderProcessLock);
+        process = activeRenderProcess;
+    }
+    if (process != nullptr && process->isRunning())
+        process->kill();
+}
+
+juce::File RvcAudioProcessor::writeBufferToTempFile(const juce::AudioBuffer<float>& audio,
                                                       int numSamples,
                                                       const juce::String& prefix)
 {
@@ -662,7 +815,7 @@ juce::File JkRvcAudioProcessor::writeBufferToTempFile(const juce::AudioBuffer<fl
     return tempFile;
 }
 
-bool JkRvcAudioProcessor::loadRenderedFile(const juce::File& file, juce::AudioBuffer<float>& destination)
+bool RvcAudioProcessor::loadRenderedFile(const juce::File& file, juce::AudioBuffer<float>& destination)
 {
     std::unique_ptr<juce::AudioFormatReader> reader(formatManager.createReaderFor(file));
     if (reader == nullptr || reader->lengthInSamples <= 0)
@@ -693,7 +846,7 @@ bool JkRvcAudioProcessor::loadRenderedFile(const juce::File& file, juce::AudioBu
     return true;
 }
 
-void JkRvcAudioProcessor::loadModelChoices()
+void RvcAudioProcessor::loadModelChoices()
 {
     models.clear();
     const auto modelRoot = resolveModelRoot();
@@ -726,7 +879,7 @@ void JkRvcAudioProcessor::loadModelChoices()
     }
 }
 
-JkRvcAudioProcessor::ModelEntry JkRvcAudioProcessor::getSelectedModel() const
+RvcAudioProcessor::ModelEntry RvcAudioProcessor::getSelectedModel() const
 {
     const auto index = selectedModelIndex.load();
     if (index >= 0 && index < (int) models.size())
@@ -735,7 +888,7 @@ JkRvcAudioProcessor::ModelEntry JkRvcAudioProcessor::getSelectedModel() const
     return {};
 }
 
-juce::StringArray JkRvcAudioProcessor::makeRenderArguments(const juce::File& inputFile,
+juce::StringArray RvcAudioProcessor::makeRenderArguments(const juce::File& inputFile,
                                                            const juce::File& outputFile,
                                                            const ModelEntry& model) const
 {
@@ -748,12 +901,13 @@ juce::StringArray JkRvcAudioProcessor::makeRenderArguments(const juce::File& inp
 #else
     const auto python = runtime.getChildFile("python").getChildFile("bin").getChildFile("python");
 #endif
-    const auto script = repo.getChildFile("tools").getChildFile("jk_offline_render.py");
+    const auto script = repo.getChildFile("tools").getChildFile("rvc_offline_render.py");
     const auto vecModel = repo.getChildFile("pretrained").getChildFile("vec-768-layer-12.onnx");
     const auto hubertModel = repo.getChildFile("assets").getChildFile("hubert").getChildFile("hubert_base.pt");
 
     juce::StringArray args;
     args.add(python.getFullPathName());
+    args.add("-u");
     args.add(script.getFullPathName());
     args.add(inputFile.getFullPathName());
     args.add(outputFile.getFullPathName());
@@ -775,12 +929,16 @@ juce::StringArray JkRvcAudioProcessor::makeRenderArguments(const juce::File& inp
     args.add("--transpose");
     args.add(juce::String(pitchShiftSemitones.load()));
     args.add("--chunk-seconds");
-    args.add("3");
+    args.add("25");
+    args.add("--crossfade-ms");
+    args.add("80");
+    args.add("--f0-method");
+    args.add("harvest");
 
     return args;
 }
 
-bool JkRvcAudioProcessor::shouldIgnoreModelFile(const juce::File& file)
+bool RvcAudioProcessor::shouldIgnoreModelFile(const juce::File& file)
 {
     auto current = file;
     for (int i = 0; i < 16 && current.exists(); ++i)
@@ -798,7 +956,7 @@ bool JkRvcAudioProcessor::shouldIgnoreModelFile(const juce::File& file)
     return false;
 }
 
-juce::File JkRvcAudioProcessor::findFirstRecursive(const juce::File& root, const juce::String& pattern)
+juce::File RvcAudioProcessor::findFirstRecursive(const juce::File& root, const juce::String& pattern)
 {
     std::vector<juce::File> files;
     if (! root.isDirectory())
@@ -819,12 +977,12 @@ juce::File JkRvcAudioProcessor::findFirstRecursive(const juce::File& root, const
     return files.empty() ? juce::File() : files.front();
 }
 
-juce::File JkRvcAudioProcessor::findBestIndex(const juce::File& root)
+juce::File RvcAudioProcessor::findBestIndex(const juce::File& root)
 {
     return findFirstRecursive(root, "*.index");
 }
 
-juce::File JkRvcAudioProcessor::findBundledRuntimeRoot()
+juce::File RvcAudioProcessor::findBundledRuntimeRoot()
 {
     const auto sharedRuntime = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
                                    .getChildFile("Application Support")
@@ -836,7 +994,7 @@ juce::File JkRvcAudioProcessor::findBundledRuntimeRoot()
 
 #if JUCE_MAC
     Dl_info info;
-    if (dladdr((const void*) &JkRvcAudioProcessor::findBundledRuntimeRoot, &info) != 0 && info.dli_fname != nullptr)
+    if (dladdr((const void*) &RvcAudioProcessor::findBundledRuntimeRoot, &info) != 0 && info.dli_fname != nullptr)
     {
         auto current = juce::File(info.dli_fname);
         for (int i = 0; i < 16 && current.exists(); ++i)
@@ -876,7 +1034,7 @@ juce::File JkRvcAudioProcessor::findBundledRuntimeRoot()
     return {};
 }
 
-juce::File JkRvcAudioProcessor::installStreamingWorkerScript()
+juce::File RvcAudioProcessor::installStreamingWorkerScript()
 {
     const auto runtime = findBundledRuntimeRoot();
     if (! runtime.isDirectory())
@@ -901,7 +1059,7 @@ juce::File JkRvcAudioProcessor::installStreamingWorkerScript()
     return destination;
 }
 
-void JkRvcAudioProcessor::configureStreamingEngine()
+void RvcAudioProcessor::configureStreamingEngine()
 {
     const auto model = getSelectedModel();
     RvcEngine::Configuration configuration;
@@ -913,7 +1071,7 @@ void JkRvcAudioProcessor::configureStreamingEngine()
     engine.configure(configuration);
 }
 
-juce::File JkRvcAudioProcessor::resolveModelRoot()
+juce::File RvcAudioProcessor::resolveModelRoot()
 {
     const auto runtime = findBundledRuntimeRoot();
     const auto bundled = runtime.getChildFile("models");
@@ -923,12 +1081,12 @@ juce::File JkRvcAudioProcessor::resolveModelRoot()
     return {};
 }
 
-juce::AudioProcessorEditor* JkRvcAudioProcessor::createEditor()
+juce::AudioProcessorEditor* RvcAudioProcessor::createEditor()
 {
-    return new JkRvcAudioProcessorEditor(*this);
+    return new RvcAudioProcessorEditor(*this);
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
-    return new JkRvcAudioProcessor();
+    return new RvcAudioProcessor();
 }
