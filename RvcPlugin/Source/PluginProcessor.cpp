@@ -55,7 +55,25 @@ void RvcAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
     const auto newSampleRate = sampleRate > 0.0 ? sampleRate : 44100.0;
     currentSampleRate.store(newSampleRate);
-    captureActive.store(false);
+
+    if (captureActive.load())
+    {
+        const juce::ScopedLock lock(captureLock);
+        if (captureActive.load())
+        {
+            if (captureStarted.load())
+            {
+                captureActive.store(false);
+            }
+            else
+            {
+                captureSampleRate.store(newSampleRate);
+                const auto tenMinuteCapacity = (int) std::ceil(newSampleRate * 600.0);
+                captureCapacitySamples = juce::jmin(tenMinuteCapacity,
+                                                    captureBuffer.getNumSamples());
+            }
+        }
+    }
 
     // Captured audio is rendered before playback, so this mode has no
     // algorithmic playback latency and does not require DAW PDC.
@@ -311,7 +329,6 @@ void RvcAudioProcessor::startCapture()
     captureCapacitySamples = (int) std::ceil(sampleRate * 600.0);
     captureBuffer.setSize(juce::jmax(1, getTotalNumInputChannels()),
                           captureCapacitySamples, false, true, false);
-    captureBuffer.clear();
     capturedSamples = 0;
     capturedSamplesAtomic.store(0);
     captureStarted.store(false);
@@ -451,9 +468,28 @@ void RvcAudioProcessor::adaptRenderedAudioToSampleRate(double targetSampleRate)
 
     {
         const juce::ScopedLock lock(renderedLock);
-        if (renderedAudio.getNumSamples() <= 0
+        const auto hasRenderedAudio = renderedAudio.getNumSamples() > 0;
+        const auto alreadyAtTarget = renderedSampleRate > 0.0
+                                  && std::abs(renderedSampleRate - targetSampleRate) <= 1.0;
+
+        if (hasRenderedAudio
+            && alreadyAtTarget
+            && ! renderInProgress.load()
+            && ! renderReady.load()
+            && sampleRateAdaptationThreads.load() > 0)
+        {
+            renderGeneration.fetch_add(1);
+            renderReady.store(true);
+            renderFailed.store(false);
+            renderedPlaybackWasAudible.store(false);
+            const juce::ScopedLock messageGuard(messageLock);
+            renderMessage = "Transform ready - press play";
+            return;
+        }
+
+        if (! hasRenderedAudio
             || renderedSampleRate <= 0.0
-            || std::abs(renderedSampleRate - targetSampleRate) <= 1.0
+            || alreadyAtTarget
             || (! renderReady.load() && sampleRateAdaptationThreads.load() <= 0)
             || (renderInProgress.load() && ! renderReady.load()))
             return;

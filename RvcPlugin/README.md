@@ -80,3 +80,5 @@ Run these scenarios in the DAW after building and installing the AU:
 1. Capture and transform audio, change the DAW buffer size, then replay the captured timeline. Confirm that the transformed result is retained and starts at the original position.
 2. At 48 kHz, capture and transform audio. Change the DAW sample rate to 44.1 kHz, wait for sample-rate adaptation to finish, then replay the captured timeline. Confirm normal pitch, speed, and timeline position.
 3. At 48 kHz, capture audio. Change the DAW sample rate to 44.1 kHz before pressing `TRANSFORM`, then transform and replay it. Confirm normal pitch and speed.
+4. Press `CAPTURE`, then select another track or change the DAW buffer size before playback. Start playback and confirm that capture begins normally without having to arm it again.
+5. With a transformed result ready at 48 kHz, change the DAW sample rate to 44.1 kHz and immediately return it to 48 kHz. Replay the captured timeline and confirm that the transformed result plays normally.
