@@ -58,8 +58,10 @@ void RvcAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     pdcDryDelayBuffer.setSize(juce::jmax(1, getTotalNumInputChannels()),
                               1, false, true, true);
     pdcDryDelayBuffer.clear();
-    pdcDelayedDryBlock.setSize(juce::jmax(1, getTotalNumOutputChannels()),
-                               juce::jmax(1, samplesPerBlock), false, true, true);
+    const auto pdcChannels = juce::jmax(2, juce::jmax(getTotalNumInputChannels(),
+                                                      getTotalNumOutputChannels()));
+    pdcDelayedDryBlock.setSize(pdcChannels, juce::jmax(samplesPerBlock, 8192),
+                               false, true, true);
     pdcDelayedDryBlock.clear();
     pdcDryDelayPosition = 0;
     pdcTransportWasPlaying = false;
@@ -163,11 +165,11 @@ void RvcAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mid
 
 void RvcAudioProcessor::advancePdcDryDelay(juce::AudioBuffer<float>& buffer) noexcept
 {
-    const auto channels = buffer.getNumChannels();
-    const auto samples = buffer.getNumSamples();
+    jassert(pdcDelayedDryBlock.getNumChannels() >= buffer.getNumChannels()
+            && pdcDelayedDryBlock.getNumSamples() >= buffer.getNumSamples());
 
-    jassert(pdcDelayedDryBlock.getNumChannels() >= channels
-            && pdcDelayedDryBlock.getNumSamples() >= samples);
+    const auto channels = juce::jmin(buffer.getNumChannels(), pdcDelayedDryBlock.getNumChannels());
+    const auto samples = juce::jmin(buffer.getNumSamples(), pdcDelayedDryBlock.getNumSamples());
 
     if (pdcLatencySamples <= 0 || pdcDryDelayBuffer.getNumSamples() < pdcLatencySamples)
     {
@@ -220,10 +222,8 @@ void RvcAudioProcessor::applyRvcBypassFade(juce::AudioBuffer<float>& wetBuffer,
         }
     }
 
-    for (int channel = channels; channel < wetBuffer.getNumChannels(); ++channel)
-        wetBuffer.clear(channel, 0, wetBuffer.getNumSamples());
-    if (samples < wetBuffer.getNumSamples())
-        wetBuffer.clear(samples, wetBuffer.getNumSamples() - samples);
+    // If a host supplies a larger-than-preallocated block, leave the remaining
+    // wet samples untouched rather than silencing them on the audio thread.
 }
 
 void RvcAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
@@ -559,6 +559,13 @@ int RvcAudioProcessor::findCapturedAudioEndSample(const juce::AudioBuffer<float>
 
 juce::String RvcAudioProcessor::getRenderStatus() const
 {
+    const juce::ScopedLock lock(messageLock);
+
+    if (renderMessage == "Model changed - transform again"
+        || renderMessage == "Pitch changed - transform again"
+        || renderMessage == "Transform cancelled")
+        return renderMessage;
+
     if (renderReady.load())
         return "Transform ready - press play";
 
@@ -568,8 +575,6 @@ juce::String RvcAudioProcessor::getRenderStatus() const
         && ! captureActive.load()
         && capturedSamplesAtomic.load() > 0)
         return "Ready to transform";
-
-    const juce::ScopedLock lock(messageLock);
 
     if (renderFailed.load())
         return renderMessage;
