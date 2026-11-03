@@ -13,6 +13,7 @@ class RvcAudioProcessor final : public juce::AudioProcessor
 #if JucePlugin_Enable_ARA
                              , public juce::AudioProcessorARAExtension
 #endif
+                             , private juce::Timer
 {
 public:
     RvcAudioProcessor();
@@ -76,6 +77,8 @@ private:
     };
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameters();
+    void timerCallback() override;
+    void trimCaptureBufferToLength();
     void loadModelChoices();
     void appendInputToCaptureBuffer(const juce::AudioBuffer<float>& buffer);
     void invalidateRenderedAudio(const juce::String& nextMessage);

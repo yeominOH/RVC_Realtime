@@ -72,3 +72,11 @@ Validate the installed Audio Unit with:
 ```sh
 auval -v aufx Jrvc Rvco
 ```
+
+## Testing
+
+Run these scenarios in the DAW after building and installing the AU:
+
+1. Capture and transform audio, change the DAW buffer size, then replay the captured timeline. Confirm that the transformed result is retained and starts at the original position.
+2. At 48 kHz, capture and transform audio. Change the DAW sample rate to 44.1 kHz, wait for sample-rate adaptation to finish, then replay the captured timeline. Confirm normal pitch, speed, and timeline position.
+3. At 48 kHz, capture audio. Change the DAW sample rate to 44.1 kHz before pressing `TRANSFORM`, then transform and replay it. Confirm normal pitch and speed.

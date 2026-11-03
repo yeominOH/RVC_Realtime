@@ -26,14 +26,16 @@ RvcAudioProcessor::RvcAudioProcessor()
         const juce::ScopedLock lock(messageLock);
         renderMessage = "Waiting for capture";
     }
+    startTimerHz(4);
 }
 
 RvcAudioProcessor::~RvcAudioProcessor()
 {
+    stopTimer();
     cancelManualRender();
     for (int i = 0; i < 500 && renderInProgress.load(); ++i)
         juce::Thread::sleep(10);
-    for (int i = 0; i < 500 && sampleRateAdaptationThreads.load() > 0; ++i)
+    while (sampleRateAdaptationThreads.load() > 0)
         juce::Thread::sleep(10);
 }
 
@@ -305,6 +307,10 @@ void RvcAudioProcessor::startCapture()
         cancelManualRender();
 
     const juce::ScopedLock lock(captureLock);
+    const auto sampleRate = currentSampleRate.load();
+    captureCapacitySamples = (int) std::ceil(sampleRate * 600.0);
+    captureBuffer.setSize(juce::jmax(1, getTotalNumInputChannels()),
+                          captureCapacitySamples, false, true, false);
     captureBuffer.clear();
     capturedSamples = 0;
     capturedSamplesAtomic.store(0);
@@ -312,7 +318,7 @@ void RvcAudioProcessor::startCapture()
     captureStartHostSample.store(-1);
     captureOverflowed.store(false);
     captureDiscontinuity.store(false);
-    captureSampleRate.store(currentSampleRate.load());
+    captureSampleRate.store(sampleRate);
     captureActive.store(true);
     invalidateRenderedAudio("Capture armed - press play");
 }
@@ -324,6 +330,44 @@ void RvcAudioProcessor::stopCapture()
     {
         const juce::ScopedLock lock(messageLock);
         renderMessage = "Ready to transform";
+    }
+}
+
+void RvcAudioProcessor::timerCallback()
+{
+    trimCaptureBufferToLength();
+}
+
+void RvcAudioProcessor::trimCaptureBufferToLength()
+{
+    if (captureActive.load() || capturedSamplesAtomic.load() <= 0)
+        return;
+
+    int samplesToKeep = 0;
+    int channelsToKeep = 0;
+    {
+        const juce::ScopedLock lock(captureLock);
+        if (captureActive.load() || capturedSamples <= 0
+            || captureBuffer.getNumSamples() == capturedSamples)
+            return;
+
+        samplesToKeep = capturedSamples;
+        channelsToKeep = captureBuffer.getNumChannels();
+    }
+
+    juce::AudioBuffer<float> trimmed(channelsToKeep, samplesToKeep);
+    {
+        const juce::ScopedLock lock(captureLock);
+        if (captureActive.load() || capturedSamples != samplesToKeep
+            || captureBuffer.getNumChannels() != channelsToKeep
+            || captureBuffer.getNumSamples() < samplesToKeep)
+            return;
+
+        for (int ch = 0; ch < channelsToKeep; ++ch)
+            trimmed.copyFrom(ch, 0, captureBuffer, ch, 0, samplesToKeep);
+
+        captureBuffer = std::move(trimmed);
+        captureCapacitySamples = samplesToKeep;
     }
 }
 
@@ -410,6 +454,7 @@ void RvcAudioProcessor::adaptRenderedAudioToSampleRate(double targetSampleRate)
         if (renderedAudio.getNumSamples() <= 0
             || renderedSampleRate <= 0.0
             || std::abs(renderedSampleRate - targetSampleRate) <= 1.0
+            || (! renderReady.load() && sampleRateAdaptationThreads.load() <= 0)
             || (renderInProgress.load() && ! renderReady.load()))
             return;
 
@@ -418,6 +463,7 @@ void RvcAudioProcessor::adaptRenderedAudioToSampleRate(double targetSampleRate)
         sourceSampleRate = renderedSampleRate;
         sourcePlayableSamples = renderedPlayableSamples;
         renderReady.store(false);
+        sampleRateAdaptationThreads.fetch_add(1);
     }
 
     renderedPlaybackWasAudible.store(false);
@@ -427,7 +473,6 @@ void RvcAudioProcessor::adaptRenderedAudioToSampleRate(double targetSampleRate)
             renderMessage = "Adapting to new sample rate...";
     }
 
-    sampleRateAdaptationThreads.fetch_add(1);
     auto* processor = this;
     const auto launched = juce::Thread::launch(
         [processor, audioToAdapt = std::move(sourceAudio), sourceSampleRate,
@@ -663,6 +708,8 @@ juce::String RvcAudioProcessor::getRenderStatus() const
 
 void RvcAudioProcessor::startManualRender()
 {
+    trimCaptureBufferToLength();
+
     if (renderInProgress.exchange(true))
         return;
 
