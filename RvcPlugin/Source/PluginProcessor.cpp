@@ -22,7 +22,10 @@ RvcAudioProcessor::RvcAudioProcessor()
 {
     formatManager.registerBasicFormats();
     loadModelChoices();
-    renderMessage = "Waiting for capture";
+    {
+        const juce::ScopedLock lock(messageLock);
+        renderMessage = "Waiting for capture";
+    }
 }
 
 RvcAudioProcessor::~RvcAudioProcessor()
@@ -82,10 +85,13 @@ void RvcAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
         renderedPlaybackPosition = 0;
         renderedPlayableSamples = 0;
         lastRenderedOutputSample = { 0.0f, 0.0f };
-        renderedPlaybackWasAudible.store(false);
-        renderReady.store(false);
-        renderFailed.store(false);
-        renderProgress.store(0.0f);
+    }
+    renderedPlaybackWasAudible.store(false);
+    renderReady.store(false);
+    renderFailed.store(false);
+    renderProgress.store(0.0f);
+    {
+        const juce::ScopedLock lock(messageLock);
         renderMessage = "Waiting for capture";
     }
 }
@@ -112,15 +118,17 @@ void RvcAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mid
 
     lastVocalDetected.store(false);
 
-    auto isPlaying = true;
+    auto isPlaying = false;
     if (auto* playHead = getPlayHead())
-        isPlaying = playHead->getPosition()->getIsPlaying();
+        if (const auto position = playHead->getPosition())
+            isPlaying = position->getIsPlaying();
+
     if (captureActive.load())
     {
         if (isPlaying)
             appendInputToCaptureBuffer(buffer);
         else if (captureStarted.load())
-            stopCapture();
+            captureActive.store(false);
     }
 
     if (! isPlaying)
@@ -158,9 +166,8 @@ void RvcAudioProcessor::advancePdcDryDelay(juce::AudioBuffer<float>& buffer) noe
     const auto channels = buffer.getNumChannels();
     const auto samples = buffer.getNumSamples();
 
-    if (pdcDelayedDryBlock.getNumChannels() < channels
-        || pdcDelayedDryBlock.getNumSamples() < samples)
-        pdcDelayedDryBlock.setSize(channels, samples, false, false, true);
+    jassert(pdcDelayedDryBlock.getNumChannels() >= channels
+            && pdcDelayedDryBlock.getNumSamples() >= samples);
 
     if (pdcLatencySamples <= 0 || pdcDryDelayBuffer.getNumSamples() < pdcLatencySamples)
     {
@@ -337,7 +344,7 @@ void RvcAudioProcessor::stopCapture()
     captureActive.store(false);
     if (capturedSamplesAtomic.load() > 0)
     {
-        const juce::ScopedLock lock(renderedLock);
+        const juce::ScopedLock lock(messageLock);
         renderMessage = "Ready to transform";
     }
 }
@@ -350,7 +357,8 @@ void RvcAudioProcessor::appendInputToCaptureBuffer(const juce::AudioBuffer<float
 
     auto hostSample = (juce::int64) -1;
     if (auto* playHead = getPlayHead())
-        hostSample = playHead->getPosition()->getTimeInSamples().orFallback((juce::int64) -1);
+        if (const auto position = playHead->getPosition())
+            hostSample = position->getTimeInSamples().orFallback((juce::int64) -1);
 
     if (captureStartHostSample.load() < 0)
     {
@@ -394,16 +402,21 @@ void RvcAudioProcessor::appendInputToCaptureBuffer(const juce::AudioBuffer<float
 void RvcAudioProcessor::invalidateRenderedAudio(const juce::String& nextMessage)
 {
     renderGeneration.fetch_add(1);
-    const juce::ScopedLock lock(renderedLock);
-    renderedAudio.setSize(0, 0);
-    renderedPlaybackPosition = 0;
-    renderedPlayableSamples = 0;
-    lastRenderedOutputSample = { 0.0f, 0.0f };
+    {
+        const juce::ScopedLock lock(renderedLock);
+        renderedAudio.setSize(0, 0);
+        renderedPlaybackPosition = 0;
+        renderedPlayableSamples = 0;
+        lastRenderedOutputSample = { 0.0f, 0.0f };
+    }
     renderedPlaybackWasAudible.store(false);
     renderReady.store(false);
     renderFailed.store(false);
     renderProgress.store(0.0f);
-    renderMessage = nextMessage;
+    {
+        const juce::ScopedLock lock(messageLock);
+        renderMessage = nextMessage;
+    }
 }
 
 bool RvcAudioProcessor::playRenderedAudioForCurrentPosition(juce::AudioBuffer<float>& buffer)
@@ -420,13 +433,14 @@ bool RvcAudioProcessor::playRenderedAudioForCurrentPosition(juce::AudioBuffer<fl
         return false;
 
     int sourceStart = renderedPlaybackPosition;
+    auto hostSample = (juce::int64) -1;
     if (auto* playHead = getPlayHead())
-    {
-        const auto hostSample = playHead->getPosition()->getTimeInSamples().orFallback((juce::int64) -1);
-        const auto startSample = captureStartHostSample.load();
-        if (hostSample >= 0 && startSample >= 0)
-            sourceStart = (int) (hostSample - startSample);
-    }
+        if (const auto position = playHead->getPosition())
+            hostSample = position->getTimeInSamples().orFallback((juce::int64) -1);
+
+    const auto startSample = captureStartHostSample.load();
+    if (hostSample >= 0 && startSample >= 0)
+        sourceStart = (int) (hostSample - startSample);
 
     if (sourceStart < 0 || sourceStart >= playableSamples)
     {
@@ -545,10 +559,17 @@ int RvcAudioProcessor::findCapturedAudioEndSample(const juce::AudioBuffer<float>
 
 juce::String RvcAudioProcessor::getRenderStatus() const
 {
-    const juce::ScopedLock lock(renderedLock);
-
     if (renderReady.load())
         return "Transform ready - press play";
+
+    if (! renderInProgress.load()
+        && ! renderReady.load()
+        && ! renderFailed.load()
+        && ! captureActive.load()
+        && capturedSamplesAtomic.load() > 0)
+        return "Ready to transform";
+
+    const juce::ScopedLock lock(messageLock);
 
     if (renderFailed.load())
         return renderMessage;
@@ -568,6 +589,7 @@ void RvcAudioProcessor::startManualRender()
     {
         renderInProgress.store(false);
         renderFailed.store(true);
+        const juce::ScopedLock lock(messageLock);
         renderMessage = "No models found";
         return;
     }
@@ -592,6 +614,7 @@ void RvcAudioProcessor::startManualRender()
     {
         renderInProgress.store(false);
         renderFailed.store(true);
+        const juce::ScopedLock lock(messageLock);
         renderMessage = "Nothing captured";
         return;
     }
@@ -601,6 +624,7 @@ void RvcAudioProcessor::startManualRender()
     {
         renderInProgress.store(false);
         renderFailed.store(true);
+        const juce::ScopedLock lock(messageLock);
         renderMessage = "Selected model missing";
         return;
     }
@@ -611,7 +635,7 @@ void RvcAudioProcessor::startManualRender()
     renderReady.store(false);
     renderProgress.store(0.03f);
     {
-        const juce::ScopedLock lock(renderedLock);
+        const juce::ScopedLock lock(messageLock);
         renderMessage = "Preparing captured audio...";
     }
 
@@ -620,6 +644,7 @@ void RvcAudioProcessor::startManualRender()
     {
         renderInProgress.store(false);
         renderFailed.store(true);
+        const juce::ScopedLock lock(messageLock);
         renderMessage = "Failed to write capture";
         return;
     }
@@ -666,7 +691,7 @@ void RvcAudioProcessor::startManualRender()
                 const auto progress = (float) juce::jlimit(0.08, 0.94,
                     0.08 + 0.86 * (completed / total));
                 processor->renderProgress.store(progress);
-                const juce::ScopedLock lock(processor->renderedLock);
+                const juce::ScopedLock lock(processor->messageLock);
                 processor->renderMessage = "Transforming voice... "
                                          + juce::String((int) std::round(progress * 100.0f)) + "%";
             }
@@ -675,7 +700,7 @@ void RvcAudioProcessor::startManualRender()
         if (! processor->renderCancelRequested.load() && process->start(args))
         {
             {
-                const juce::ScopedLock lock(processor->renderedLock);
+                const juce::ScopedLock lock(processor->messageLock);
                 processor->renderMessage = "Loading model and analyzing audio...";
             }
             processor->renderProgress.store(0.08f);
@@ -700,45 +725,59 @@ void RvcAudioProcessor::startManualRender()
         {
             processor->renderProgress.store(0.97f);
             {
-                const juce::ScopedLock lock(processor->renderedLock);
+                const juce::ScopedLock lock(processor->messageLock);
                 processor->renderMessage = "Finalizing transformed audio...";
             }
             ok = processor->loadRenderedFile(outputFile, loaded);
         }
 
         const auto currentGeneration = processor->renderGeneration.load() == generation;
+        if (currentGeneration && ok)
         {
-            const juce::ScopedLock lock(processor->renderedLock);
-            if (currentGeneration && ok)
             {
+                const juce::ScopedLock lock(processor->renderedLock);
                 processor->renderedAudio = std::move(loaded);
                 processor->renderedPlaybackPosition = 0;
                 processor->renderedPlayableSamples = juce::jmin(playableSamplesToRender,
                                                                  processor->renderedAudio.getNumSamples());
                 processor->lastRenderedOutputSample = { 0.0f, 0.0f };
-                processor->renderedPlaybackWasAudible.store(false);
-                processor->renderMessage = "Transform ready - press play";
-                processor->renderReady.store(true);
-                processor->renderFailed.store(false);
-                processor->renderProgress.store(1.0f);
             }
-            else if (currentGeneration)
+            processor->renderedPlaybackWasAudible.store(false);
             {
+                const juce::ScopedLock lock(processor->messageLock);
+                processor->renderMessage = "Transform ready - press play";
+            }
+            processor->renderReady.store(true);
+            processor->renderFailed.store(false);
+            processor->renderProgress.store(1.0f);
+        }
+        else if (currentGeneration)
+        {
+            {
+                const juce::ScopedLock lock(processor->renderedLock);
                 processor->renderedAudio.setSize(0, 0);
                 processor->renderedPlaybackPosition = 0;
                 processor->renderedPlayableSamples = 0;
                 processor->lastRenderedOutputSample = { 0.0f, 0.0f };
-                processor->renderedPlaybackWasAudible.store(false);
-                const auto cancelled = processor->renderCancelRequested.load();
-                const auto errorStart = juce::jmax(0, processOutput.length() - 240);
-                processor->renderMessage = cancelled ? "Transform cancelled"
-                    : (processOutput.isNotEmpty() ? processOutput.substring(errorStart) : "Transform failed");
-                processor->renderReady.store(false);
-                processor->renderFailed.store(! cancelled);
-                processor->renderProgress.store(0.0f);
             }
-            else if (! currentGeneration && processor->renderCancelRequested.load()
-                     && processor->renderMessage == "Cancelling transform...")
+            processor->renderedPlaybackWasAudible.store(false);
+            const auto cancelled = processor->renderCancelRequested.load();
+            const auto errorStart = juce::jmax(0, processOutput.length() - 240);
+            const auto failureMessage = cancelled ? juce::String("Transform cancelled")
+                : (processOutput.isNotEmpty() ? processOutput.substring(errorStart)
+                                              : juce::String("Transform failed"));
+            {
+                const juce::ScopedLock lock(processor->messageLock);
+                processor->renderMessage = failureMessage;
+            }
+            processor->renderReady.store(false);
+            processor->renderFailed.store(! cancelled);
+            processor->renderProgress.store(0.0f);
+        }
+        else if (processor->renderCancelRequested.load())
+        {
+            const juce::ScopedLock lock(processor->messageLock);
+            if (processor->renderMessage == "Cancelling transform...")
             {
                 processor->renderMessage = "Transform cancelled";
                 processor->renderProgress.store(0.0f);
@@ -762,7 +801,7 @@ void RvcAudioProcessor::startManualRender()
         renderInProgress.store(false);
         renderFailed.store(true);
         renderProgress.store(0.0f);
-        const juce::ScopedLock lock(renderedLock);
+        const juce::ScopedLock lock(messageLock);
         renderMessage = "Could not start transform worker";
     }
 }
@@ -775,7 +814,7 @@ void RvcAudioProcessor::cancelManualRender()
     renderCancelRequested.store(true);
     renderGeneration.fetch_add(1);
     {
-        const juce::ScopedLock lock(renderedLock);
+        const juce::ScopedLock lock(messageLock);
         renderMessage = "Cancelling transform...";
     }
 

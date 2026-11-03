@@ -119,6 +119,7 @@ private:
     std::atomic<juce::int64> captureStartHostSample { -1 };
 
     mutable juce::CriticalSection renderedLock;
+    mutable juce::CriticalSection messageLock;
     juce::AudioBuffer<float> renderedAudio;
     int renderedPlaybackPosition = 0;
     int renderedPlayableSamples = 0;
