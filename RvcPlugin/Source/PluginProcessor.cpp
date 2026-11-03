@@ -33,6 +33,8 @@ RvcAudioProcessor::~RvcAudioProcessor()
     cancelManualRender();
     for (int i = 0; i < 500 && renderInProgress.load(); ++i)
         juce::Thread::sleep(10);
+    for (int i = 0; i < 500 && sampleRateAdaptationThreads.load() > 0; ++i)
+        juce::Thread::sleep(10);
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout RvcAudioProcessor::createParameters()
@@ -49,7 +51,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout RvcAudioProcessor::createPar
 
 void RvcAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
-    currentSampleRate = sampleRate > 0.0 ? sampleRate : 44100.0;
+    const auto newSampleRate = sampleRate > 0.0 ? sampleRate : 44100.0;
+    currentSampleRate.store(newSampleRate);
+    captureActive.store(false);
 
     // Captured audio is rendered before playback, so this mode has no
     // algorithmic playback latency and does not require DAW PDC.
@@ -65,37 +69,10 @@ void RvcAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     pdcDelayedDryBlock.clear();
     pdcDryDelayPosition = 0;
     pdcTransportWasPlaying = false;
-    bypassFadeLengthSamples = juce::jmax(1, (int) std::round(currentSampleRate * 0.02));
+    bypassFadeLengthSamples = juce::jmax(1, (int) std::round(newSampleRate * 0.02));
     bypassDryMix = state.getRawParameterValue("rvcEnabled")->load() > 0.5f ? 0.0f : 1.0f;
 
-    {
-        const juce::ScopedLock lock(captureLock);
-        captureCapacitySamples = (int) std::ceil(currentSampleRate * 600.0);
-        captureBuffer.setSize(juce::jmax(1, getTotalNumInputChannels()), captureCapacitySamples, false, true, true);
-        captureBuffer.clear();
-        capturedSamples = 0;
-        capturedSamplesAtomic.store(0);
-        captureStarted.store(false);
-        captureStartHostSample.store(-1);
-        captureOverflowed.store(false);
-        captureDiscontinuity.store(false);
-    }
-
-    {
-        const juce::ScopedLock lock(renderedLock);
-        renderedAudio.setSize(0, 0);
-        renderedPlaybackPosition = 0;
-        renderedPlayableSamples = 0;
-        lastRenderedOutputSample = { 0.0f, 0.0f };
-    }
-    renderedPlaybackWasAudible.store(false);
-    renderReady.store(false);
-    renderFailed.store(false);
-    renderProgress.store(0.0f);
-    {
-        const juce::ScopedLock lock(messageLock);
-        renderMessage = "Waiting for capture";
-    }
+    adaptRenderedAudioToSampleRate(newSampleRate);
 }
 
 void RvcAudioProcessor::releaseResources()
@@ -299,7 +276,7 @@ int RvcAudioProcessor::getSharedSelectedModelIndex() noexcept
 
 double RvcAudioProcessor::getCapturedSeconds() const noexcept
 {
-    return (double) capturedSamplesAtomic.load() / juce::jmax(1.0, currentSampleRate);
+    return (double) capturedSamplesAtomic.load() / juce::jmax(1.0, captureSampleRate.load());
 }
 
 juce::String RvcAudioProcessor::getCaptureStatus() const
@@ -335,6 +312,7 @@ void RvcAudioProcessor::startCapture()
     captureStartHostSample.store(-1);
     captureOverflowed.store(false);
     captureDiscontinuity.store(false);
+    captureSampleRate.store(currentSampleRate.load());
     captureActive.store(true);
     invalidateRenderedAudio("Capture armed - press play");
 }
@@ -401,12 +379,13 @@ void RvcAudioProcessor::appendInputToCaptureBuffer(const juce::AudioBuffer<float
 
 void RvcAudioProcessor::invalidateRenderedAudio(const juce::String& nextMessage)
 {
-    renderGeneration.fetch_add(1);
     {
         const juce::ScopedLock lock(renderedLock);
+        renderGeneration.fetch_add(1);
         renderedAudio.setSize(0, 0);
         renderedPlaybackPosition = 0;
         renderedPlayableSamples = 0;
+        renderedSampleRate = 0.0;
         lastRenderedOutputSample = { 0.0f, 0.0f };
     }
     renderedPlaybackWasAudible.store(false);
@@ -416,6 +395,95 @@ void RvcAudioProcessor::invalidateRenderedAudio(const juce::String& nextMessage)
     {
         const juce::ScopedLock lock(messageLock);
         renderMessage = nextMessage;
+    }
+}
+
+void RvcAudioProcessor::adaptRenderedAudioToSampleRate(double targetSampleRate)
+{
+    juce::AudioBuffer<float> sourceAudio;
+    double sourceSampleRate = 0.0;
+    int sourcePlayableSamples = 0;
+    int generation = 0;
+
+    {
+        const juce::ScopedLock lock(renderedLock);
+        if (renderedAudio.getNumSamples() <= 0
+            || renderedSampleRate <= 0.0
+            || std::abs(renderedSampleRate - targetSampleRate) <= 1.0
+            || (renderInProgress.load() && ! renderReady.load()))
+            return;
+
+        generation = renderGeneration.fetch_add(1) + 1;
+        sourceAudio.makeCopyOf(renderedAudio);
+        sourceSampleRate = renderedSampleRate;
+        sourcePlayableSamples = renderedPlayableSamples;
+        renderReady.store(false);
+    }
+
+    renderedPlaybackWasAudible.store(false);
+    {
+        const juce::ScopedLock lock(messageLock);
+        if (renderGeneration.load() == generation)
+            renderMessage = "Adapting to new sample rate...";
+    }
+
+    sampleRateAdaptationThreads.fetch_add(1);
+    auto* processor = this;
+    const auto launched = juce::Thread::launch(
+        [processor, audioToAdapt = std::move(sourceAudio), sourceSampleRate,
+         targetSampleRate, sourcePlayableSamples, generation]() mutable
+        {
+            juce::AudioBuffer<float> adapted;
+            const auto ok = resampleAudioBuffer(audioToAdapt, sourceSampleRate,
+                                                targetSampleRate, adapted);
+            auto committed = false;
+
+            if (ok && processor->renderGeneration.load() == generation
+                && std::abs(processor->currentSampleRate.load() - targetSampleRate) <= 1.0)
+            {
+                const juce::ScopedLock lock(processor->renderedLock);
+                if (processor->renderGeneration.load() == generation
+                    && std::abs(processor->currentSampleRate.load() - targetSampleRate) <= 1.0)
+                {
+                    processor->renderedAudio = std::move(adapted);
+                    processor->renderedPlaybackPosition = 0;
+                    processor->renderedPlayableSamples = juce::jlimit(
+                        0, processor->renderedAudio.getNumSamples(),
+                        (int) std::llround((double) sourcePlayableSamples
+                                           * targetSampleRate / sourceSampleRate));
+                    processor->renderedSampleRate = targetSampleRate;
+                    processor->lastRenderedOutputSample = { 0.0f, 0.0f };
+                    processor->renderReady.store(true);
+                    committed = true;
+                }
+            }
+
+            if (committed)
+            {
+                processor->renderedPlaybackWasAudible.store(false);
+                processor->renderFailed.store(false);
+                const juce::ScopedLock lock(processor->messageLock);
+                if (processor->renderGeneration.load() == generation)
+                    processor->renderMessage = "Transform ready - press play";
+            }
+            else if (! ok && processor->renderGeneration.load() == generation)
+            {
+                processor->renderFailed.store(true);
+                const juce::ScopedLock lock(processor->messageLock);
+                if (processor->renderGeneration.load() == generation)
+                    processor->renderMessage = "Sample rate adaptation failed";
+            }
+
+            processor->sampleRateAdaptationThreads.fetch_sub(1);
+        });
+
+    if (! launched)
+    {
+        sampleRateAdaptationThreads.fetch_sub(1);
+        renderFailed.store(true);
+        const juce::ScopedLock lock(messageLock);
+        if (renderGeneration.load() == generation)
+            renderMessage = "Could not start sample rate adaptation";
     }
 }
 
@@ -438,9 +506,17 @@ bool RvcAudioProcessor::playRenderedAudioForCurrentPosition(juce::AudioBuffer<fl
         if (const auto position = playHead->getPosition())
             hostSample = position->getTimeInSamples().orFallback((juce::int64) -1);
 
-    const auto startSample = captureStartHostSample.load();
-    if (hostSample >= 0 && startSample >= 0)
-        sourceStart = (int) (hostSample - startSample);
+    const auto capturedAtSampleRate = captureSampleRate.load();
+    if (capturedAtSampleRate <= 0.0)
+        return false;
+
+    const auto captureStartSample = captureStartHostSample.load();
+    if (hostSample >= 0 && captureStartSample >= 0)
+    {
+        const auto startAtCurrentRate = (juce::int64) std::llround(
+            (double) captureStartSample * currentSampleRate.load() / capturedAtSampleRate);
+        sourceStart = (int) (hostSample - startAtCurrentRate);
+    }
 
     if (sourceStart < 0 || sourceStart >= playableSamples)
     {
@@ -553,7 +629,7 @@ int RvcAudioProcessor::findCapturedAudioEndSample(const juce::AudioBuffer<float>
     if (lastActiveSample < 0)
         return 0;
 
-    const auto releaseSamples = (int) std::round(currentSampleRate * 0.12);
+    const auto releaseSamples = (int) std::round(captureSampleRate.load() * 0.12);
     return juce::jlimit(0, boundedSamples, lastActiveSample + releaseSamples);
 }
 
@@ -602,9 +678,11 @@ void RvcAudioProcessor::startManualRender()
     juce::AudioBuffer<float> captured;
     int samplesToRender = 0;
     int playableSamplesToRender = 0;
+    double capturedAtSampleRate = 0.0;
     {
         const juce::ScopedLock lock(captureLock);
         samplesToRender = capturedSamples;
+        capturedAtSampleRate = captureSampleRate.load();
         if (samplesToRender > 0)
         {
             captured.setSize(captureBuffer.getNumChannels(), samplesToRender);
@@ -615,7 +693,7 @@ void RvcAudioProcessor::startManualRender()
         }
     }
 
-    if (samplesToRender <= 0)
+    if (samplesToRender <= 0 || capturedAtSampleRate <= 0.0)
     {
         renderInProgress.store(false);
         renderFailed.store(true);
@@ -634,10 +712,14 @@ void RvcAudioProcessor::startManualRender()
         return;
     }
 
-    const auto generation = renderGeneration.fetch_add(1) + 1;
+    int generation = 0;
+    {
+        const juce::ScopedLock lock(renderedLock);
+        generation = renderGeneration.fetch_add(1) + 1;
+        renderReady.store(false);
+    }
     renderCancelRequested.store(false);
     renderFailed.store(false);
-    renderReady.store(false);
     renderProgress.store(0.03f);
     {
         const juce::ScopedLock lock(messageLock);
@@ -659,7 +741,8 @@ void RvcAudioProcessor::startManualRender()
     auto* processor = this;
 
     const auto launched = juce::Thread::launch([processor, args, inputFile, outputFile,
-                                                 playableSamplesToRender, generation]
+                                                 playableSamplesToRender, capturedAtSampleRate,
+                                                 generation]
     {
         bool ok = false;
         juce::String processOutput;
@@ -726,6 +809,7 @@ void RvcAudioProcessor::startManualRender()
         }
 
         juce::AudioBuffer<float> loaded;
+        auto loadedSampleRate = processor->currentSampleRate.load();
         if (ok)
         {
             processor->renderProgress.store(0.97f);
@@ -733,26 +817,54 @@ void RvcAudioProcessor::startManualRender()
                 const juce::ScopedLock lock(processor->messageLock);
                 processor->renderMessage = "Finalizing transformed audio...";
             }
-            ok = processor->loadRenderedFile(outputFile, loaded);
+            ok = processor->loadRenderedFile(outputFile, loaded, loadedSampleRate);
+        }
+
+        auto committed = false;
+        while (ok && processor->renderGeneration.load() == generation)
+        {
+            const auto latestSampleRate = processor->currentSampleRate.load();
+            if (std::abs(loadedSampleRate - latestSampleRate) > 1.0)
+            {
+                juce::AudioBuffer<float> readapted;
+                ok = resampleAudioBuffer(loaded, loadedSampleRate, latestSampleRate, readapted);
+                if (! ok)
+                    break;
+
+                loaded = std::move(readapted);
+                loadedSampleRate = latestSampleRate;
+                continue;
+            }
+
+            {
+                const juce::ScopedLock lock(processor->renderedLock);
+                if (processor->renderGeneration.load() != generation
+                    || std::abs(processor->currentSampleRate.load() - loadedSampleRate) > 1.0)
+                    continue;
+
+                processor->renderedAudio = std::move(loaded);
+                processor->renderedPlaybackPosition = 0;
+                processor->renderedPlayableSamples = juce::jlimit(
+                    0, processor->renderedAudio.getNumSamples(),
+                    (int) std::llround((double) playableSamplesToRender
+                                       * loadedSampleRate / capturedAtSampleRate));
+                processor->renderedSampleRate = loadedSampleRate;
+                processor->lastRenderedOutputSample = { 0.0f, 0.0f };
+                processor->renderReady.store(true);
+                committed = true;
+            }
+            break;
         }
 
         const auto currentGeneration = processor->renderGeneration.load() == generation;
-        if (currentGeneration && ok)
+        if (currentGeneration && committed)
         {
-            {
-                const juce::ScopedLock lock(processor->renderedLock);
-                processor->renderedAudio = std::move(loaded);
-                processor->renderedPlaybackPosition = 0;
-                processor->renderedPlayableSamples = juce::jmin(playableSamplesToRender,
-                                                                 processor->renderedAudio.getNumSamples());
-                processor->lastRenderedOutputSample = { 0.0f, 0.0f };
-            }
             processor->renderedPlaybackWasAudible.store(false);
             {
                 const juce::ScopedLock lock(processor->messageLock);
-                processor->renderMessage = "Transform ready - press play";
+                if (processor->renderGeneration.load() == generation)
+                    processor->renderMessage = "Transform ready - press play";
             }
-            processor->renderReady.store(true);
             processor->renderFailed.store(false);
             processor->renderProgress.store(1.0f);
         }
@@ -763,6 +875,7 @@ void RvcAudioProcessor::startManualRender()
                 processor->renderedAudio.setSize(0, 0);
                 processor->renderedPlaybackPosition = 0;
                 processor->renderedPlayableSamples = 0;
+                processor->renderedSampleRate = 0.0;
                 processor->lastRenderedOutputSample = { 0.0f, 0.0f };
             }
             processor->renderedPlaybackWasAudible.store(false);
@@ -836,6 +949,10 @@ juce::File RvcAudioProcessor::writeBufferToTempFile(const juce::AudioBuffer<floa
                                                       int numSamples,
                                                       const juce::String& prefix)
 {
+    const auto sourceSampleRate = captureSampleRate.load();
+    if (sourceSampleRate <= 0.0)
+        return {};
+
     const auto tempFile = juce::File::getSpecialLocation(juce::File::tempDirectory)
                               .getChildFile(prefix + "_"
                                             + juce::String((juce::int64) juce::Time::getMillisecondCounterHiRes())
@@ -847,7 +964,7 @@ juce::File RvcAudioProcessor::writeBufferToTempFile(const juce::AudioBuffer<floa
         return {};
 
     const auto writerOptions = juce::AudioFormatWriter::Options {}
-                                   .withSampleRate(currentSampleRate)
+                                   .withSampleRate(sourceSampleRate)
                                    .withNumChannels(audio.getNumChannels())
                                    .withBitsPerSample(24);
 
@@ -859,7 +976,9 @@ juce::File RvcAudioProcessor::writeBufferToTempFile(const juce::AudioBuffer<floa
     return tempFile;
 }
 
-bool RvcAudioProcessor::loadRenderedFile(const juce::File& file, juce::AudioBuffer<float>& destination)
+bool RvcAudioProcessor::loadRenderedFile(const juce::File& file,
+                                         juce::AudioBuffer<float>& destination,
+                                         double targetSampleRate)
 {
     std::unique_ptr<juce::AudioFormatReader> reader(formatManager.createReaderFor(file));
     if (reader == nullptr || reader->lengthInSamples <= 0)
@@ -869,24 +988,48 @@ bool RvcAudioProcessor::loadRenderedFile(const juce::File& file, juce::AudioBuff
     if (! reader->read(&loaded, 0, loaded.getNumSamples(), 0, true, true))
         return false;
 
-    if (reader->sampleRate > 0.0 && std::abs(reader->sampleRate - currentSampleRate) > 1.0)
+    return resampleAudioBuffer(loaded, reader->sampleRate, targetSampleRate, destination);
+}
+
+bool RvcAudioProcessor::resampleAudioBuffer(const juce::AudioBuffer<float>& source,
+                                            double sourceSampleRate,
+                                            double targetSampleRate,
+                                            juce::AudioBuffer<float>& destination)
+{
+    if (source.getNumChannels() <= 0 || source.getNumSamples() <= 0
+        || sourceSampleRate <= 0.0 || targetSampleRate <= 0.0)
+        return false;
+
+    if (std::abs(sourceSampleRate - targetSampleRate) <= 1.0)
     {
-        const auto targetSamples = juce::jmax(1, (int) std::llround((double) loaded.getNumSamples()
-                                                                    * currentSampleRate
-                                                                    / reader->sampleRate));
-        juce::AudioBuffer<float> resampled(loaded.getNumChannels(), targetSamples);
-        const auto speedRatio = reader->sampleRate / currentSampleRate;
-
-        for (int ch = 0; ch < loaded.getNumChannels(); ++ch)
-        {
-            juce::LagrangeInterpolator interpolator;
-            interpolator.process(speedRatio, loaded.getReadPointer(ch), resampled.getWritePointer(ch), targetSamples);
-        }
-
-        loaded = std::move(resampled);
+        destination.makeCopyOf(source);
+        return true;
     }
 
-    destination = std::move(loaded);
+    const auto targetSamples = juce::jmax(
+        1, (int) std::llround((double) source.getNumSamples()
+                              * targetSampleRate / sourceSampleRate));
+    const auto speedRatio = sourceSampleRate / targetSampleRate;
+    const auto latencySamples = juce::jmax(
+        0, (int) std::ceil((double) juce::WindowedSincInterpolator::getBaseLatency()
+                           / speedRatio));
+    const auto generatedSamples = targetSamples + latencySamples;
+
+    juce::AudioBuffer<float> interpolated(source.getNumChannels(), generatedSamples);
+    destination.setSize(source.getNumChannels(), targetSamples, false, false, true);
+
+    for (int ch = 0; ch < source.getNumChannels(); ++ch)
+    {
+        juce::WindowedSincInterpolator interpolator;
+        interpolator.process(speedRatio,
+                             source.getReadPointer(ch),
+                             interpolated.getWritePointer(ch),
+                             generatedSamples,
+                             source.getNumSamples(),
+                             0);
+        destination.copyFrom(ch, 0, interpolated, ch, latencySamples, targetSamples);
+    }
+
     return true;
 }
 

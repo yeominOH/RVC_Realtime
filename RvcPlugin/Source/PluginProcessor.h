@@ -79,11 +79,18 @@ private:
     void loadModelChoices();
     void appendInputToCaptureBuffer(const juce::AudioBuffer<float>& buffer);
     void invalidateRenderedAudio(const juce::String& nextMessage);
+    void adaptRenderedAudioToSampleRate(double targetSampleRate);
     bool playRenderedAudioForCurrentPosition(juce::AudioBuffer<float>& buffer);
     void cutRenderedPlaybackToSilence(juce::AudioBuffer<float>& buffer);
     int findCapturedAudioEndSample(const juce::AudioBuffer<float>& audio, int numSamples) const;
     juce::File writeBufferToTempFile(const juce::AudioBuffer<float>& audio, int numSamples, const juce::String& prefix);
-    bool loadRenderedFile(const juce::File& file, juce::AudioBuffer<float>& destination);
+    bool loadRenderedFile(const juce::File& file,
+                          juce::AudioBuffer<float>& destination,
+                          double targetSampleRate);
+    static bool resampleAudioBuffer(const juce::AudioBuffer<float>& source,
+                                    double sourceSampleRate,
+                                    double targetSampleRate,
+                                    juce::AudioBuffer<float>& destination);
     ModelEntry getSelectedModel() const;
     juce::StringArray makeRenderArguments(const juce::File& inputFile, const juce::File& outputFile, const ModelEntry& model) const;
     static juce::File findBundledRuntimeRoot();
@@ -117,12 +124,14 @@ private:
     std::atomic<bool> captureOverflowed { false };
     std::atomic<bool> captureDiscontinuity { false };
     std::atomic<juce::int64> captureStartHostSample { -1 };
+    std::atomic<double> captureSampleRate { 0.0 };
 
     mutable juce::CriticalSection renderedLock;
     mutable juce::CriticalSection messageLock;
     juce::AudioBuffer<float> renderedAudio;
     int renderedPlaybackPosition = 0;
     int renderedPlayableSamples = 0;
+    double renderedSampleRate = 0.0;
     std::array<float, 2> lastRenderedOutputSample { 0.0f, 0.0f };
     std::atomic<bool> renderedPlaybackWasAudible { false };
     std::atomic<bool> renderInProgress { false };
@@ -131,11 +140,12 @@ private:
     std::atomic<bool> renderCancelRequested { false };
     std::atomic<float> renderProgress { 0.0f };
     std::atomic<int> renderGeneration { 0 };
+    std::atomic<int> sampleRateAdaptationThreads { 0 };
     mutable juce::CriticalSection renderProcessLock;
     std::shared_ptr<juce::ChildProcess> activeRenderProcess;
     juce::String renderMessage;
 
-    double currentSampleRate = 44100.0;
+    std::atomic<double> currentSampleRate { 44100.0 };
     juce::AudioBuffer<float> pdcDryDelayBuffer;
     juce::AudioBuffer<float> pdcDelayedDryBlock;
     int pdcDryDelayPosition = 0;
