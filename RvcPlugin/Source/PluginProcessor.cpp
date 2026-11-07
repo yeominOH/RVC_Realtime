@@ -413,6 +413,79 @@ void RvcAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
             return;
         }
 
+        auto matchesInMemorySession = false;
+        auto inMemoryRenderedModel = -1;
+        auto inMemoryRenderedPitch = 0;
+        {
+            const juce::ScopedLock lock(sessionLock);
+            matchesInMemorySession = sessionId == restoredSessionId
+                                  && capturedSamplesAtomic.load() > 0;
+            if (matchesInMemorySession)
+            {
+                inMemoryRenderedModel = renderedModelIndex;
+                inMemoryRenderedPitch = renderedPitch;
+            }
+        }
+
+        if (matchesInMemorySession)
+        {
+            auto hasRenderedMemory = false;
+            auto memoryRenderRate = 0.0;
+            {
+                const juce::ScopedLock lock(renderedLock);
+                hasRenderedMemory = renderedAudio.getNumChannels() > 0
+                                 && renderedAudio.getNumSamples() > 0;
+                memoryRenderRate = renderedSampleRate;
+            }
+
+            const auto modelChanged = hasRenderedMemory
+                                   && validModel != inMemoryRenderedModel;
+            const auto pitchChanged = hasRenderedMemory
+                                   && validPitch != inMemoryRenderedPitch;
+            if (modelChanged || pitchChanged)
+            {
+                if (renderInProgress.load())
+                    cancelManualRender();
+                else
+                    renderGeneration.fetch_add(1);
+
+                renderReady.store(false);
+                renderFailed.store(false);
+                renderProgress.store(0.0f);
+                renderedPlaybackWasAudible.store(false);
+                const juce::ScopedLock lock(messageLock);
+                renderMessage = modelChanged ? "Model changed - transform again"
+                                             : "Pitch changed - transform again";
+            }
+            else if (! captureActive.load() && ! renderInProgress.load()
+                     && sampleRateAdaptationThreads.load() <= 0)
+            {
+                renderFailed.store(false);
+                if (hasRenderedMemory)
+                {
+                    renderReady.store(true);
+                    {
+                        const juce::ScopedLock lock(messageLock);
+                        renderMessage = "Transform ready - press play";
+                    }
+                    if (memoryRenderRate > 0.0
+                        && std::abs(memoryRenderRate - currentSampleRate.load()) > 1.0)
+                        adaptRenderedAudioToSampleRate(currentSampleRate.load());
+                }
+                else
+                {
+                    renderReady.store(false);
+                    const juce::ScopedLock lock(messageLock);
+                    renderMessage = "Transform again";
+                }
+            }
+
+            RVC_WRITE_DEBUG_LOG(this, "sessionLoad.complete",
+                                "sessionId=" + restoredSessionId
+                                + ", mode=in-memory");
+            return;
+        }
+
         captureFileName = captureFileName.replaceCharacter('\\', '/')
                                          .fromLastOccurrenceOf("/", false, false);
         renderFileName = renderFileName.replaceCharacter('\\', '/')
