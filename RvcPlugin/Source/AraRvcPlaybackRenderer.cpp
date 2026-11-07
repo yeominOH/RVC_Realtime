@@ -101,7 +101,7 @@ bool AraRvcPlaybackRenderer::processBlock(juce::AudioBuffer<float>& buffer,
 
 AraRvcPlaybackRenderer::RenderCache& AraRvcPlaybackRenderer::getOrCreateRender(const juce::ARAAudioSource& audioSource)
 {
-    const auto modelIndex = JkRvcAudioProcessor::getSharedSelectedModelIndex();
+    const auto modelIndex = RvcAudioProcessor::getSharedSelectedModelIndex();
     const auto key = juce::String::toHexString((juce::int64) (uintptr_t) &audioSource)
                    + "_m" + juce::String(modelIndex)
                    + "_l" + juce::String((juce::int64) std::llround(audioSource.getSampleCount()));
@@ -121,7 +121,7 @@ bool AraRvcPlaybackRenderer::renderAudioSource(const juce::ARAAudioSource& audio
         return false;
     }
 
-    const auto modelIndex = juce::jlimit(0, (int) models.size() - 1, JkRvcAudioProcessor::getSharedSelectedModelIndex());
+    const auto modelIndex = juce::jlimit(0, (int) models.size() - 1, RvcAudioProcessor::getSharedSelectedModelIndex());
     const auto model = models[(size_t) modelIndex];
     if (! model.onnxFile.existsAsFile())
     {
@@ -129,7 +129,7 @@ bool AraRvcPlaybackRenderer::renderAudioSource(const juce::ARAAudioSource& audio
         return false;
     }
 
-    const auto tempDir = juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("JK RVC ARA");
+    const auto tempDir = juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("RVC ARA");
     tempDir.createDirectory();
     const auto stamp = juce::String((juce::int64) juce::Time::getMillisecondCounterHiRes());
     const auto inputFile = tempDir.getChildFile("ara_source_" + stamp + ".wav");
@@ -235,7 +235,7 @@ juce::StringArray AraRvcPlaybackRenderer::makeRenderArguments(const juce::File& 
 {
     const auto runtime = findBundledRuntimeRoot();
     auto python = runtime.getChildFile("python/bin/python");
-    auto script = runtime.getChildFile("repo/tools/jk_offline_render.py");
+    auto script = runtime.getChildFile("repo/tools/rvc_offline_render.py");
     auto vec = runtime.getChildFile("repo/pretrained/vec-768-layer-12.onnx");
     auto hubert = runtime.getChildFile("repo/assets/hubert/hubert_base.pt");
 

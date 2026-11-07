@@ -6,16 +6,18 @@
 #include "RvcEngine.h"
 
 #include <array>
+#include <memory>
 #include <vector>
 
-class JkRvcAudioProcessor final : public juce::AudioProcessor
+class RvcAudioProcessor final : public juce::AudioProcessor
 #if JucePlugin_Enable_ARA
                              , public juce::AudioProcessorARAExtension
 #endif
+                             , private juce::Timer
 {
 public:
-    JkRvcAudioProcessor();
-    ~JkRvcAudioProcessor() override = default;
+    RvcAudioProcessor();
+    ~RvcAudioProcessor() override;
 
     void prepareToPlay(double sampleRate, int samplesPerBlock) override;
     void releaseResources() override;
@@ -58,14 +60,37 @@ public:
     bool hasCapturedAudio() const noexcept { return capturedSamplesAtomic.load() > 0; }
     double getCapturedSeconds() const noexcept;
     void startManualRender();
+    void cancelManualRender();
     bool isRendering() const noexcept { return renderInProgress.load(); }
     bool hasRenderedAudio() const noexcept { return renderReady.load(); }
+    float getRenderProgress() const noexcept { return renderProgress.load(); }
     juce::String getCaptureStatus() const;
     juce::String getRenderStatus() const;
 
 private:
+    struct BackgroundState
+    {
+        juce::CriticalSection ownerLock;
+        RvcAudioProcessor* owner = nullptr;
+        std::atomic<int> activeTasks { 0 };
+        std::atomic<int> renderTasks { 0 };
+    };
+
+    template <typename Callback>
+    static bool withBackgroundProcessor(const std::shared_ptr<BackgroundState>& background,
+                                        Callback&& callback)
+    {
+        const juce::ScopedLock lock(background->ownerLock);
+        if (background->owner == nullptr)
+            return false;
+
+        callback(*background->owner);
+        return true;
+    }
+
     struct ModelEntry
     {
+        juce::String id;
         juce::String name;
         juce::File onnxFile;
         juce::File pthFile;
@@ -73,13 +98,43 @@ private:
     };
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameters();
+    void timerCallback() override;
+    void trimCaptureBufferToLength();
+    void scheduleCaptureSave();
+    void saveCaptureSynchronouslyIfNeeded();
+    void createNewSession();
+    static juce::File getSessionsRoot();
+    static juce::File getSessionDirectory(const juce::String& id);
+    static bool writeFloatWavFile(const juce::File& file,
+                                  const juce::AudioBuffer<float>& audio,
+                                  int numSamples,
+                                  double sampleRate);
+    static bool writeNewSessionRenderFile(const juce::String& id,
+                                          const juce::AudioBuffer<float>& audio,
+                                          double sampleRate,
+                                          juce::File& destination,
+                                          int& sequence);
+    static bool readFloatWavFile(const juce::File& file,
+                                 juce::AudioBuffer<float>& destination,
+                                 double& sampleRate);
     void loadModelChoices();
+    int findModelIndexById(const juce::String& id) const;
+    juce::String getModelIdForIndex(int index) const;
+    juce::String getReadyRenderMessage() const;
     void appendInputToCaptureBuffer(const juce::AudioBuffer<float>& buffer);
+    void invalidateRenderedAudio(const juce::String& nextMessage);
+    void adaptRenderedAudioToSampleRate(double targetSampleRate);
     bool playRenderedAudioForCurrentPosition(juce::AudioBuffer<float>& buffer);
     void cutRenderedPlaybackToSilence(juce::AudioBuffer<float>& buffer);
     int findCapturedAudioEndSample(const juce::AudioBuffer<float>& audio, int numSamples) const;
     juce::File writeBufferToTempFile(const juce::AudioBuffer<float>& audio, int numSamples, const juce::String& prefix);
-    bool loadRenderedFile(const juce::File& file, juce::AudioBuffer<float>& destination);
+    bool loadRenderedFile(const juce::File& file,
+                          juce::AudioBuffer<float>& destination,
+                          double targetSampleRate);
+    static bool resampleAudioBuffer(const juce::AudioBuffer<float>& source,
+                                    double sourceSampleRate,
+                                    double targetSampleRate,
+                                    juce::AudioBuffer<float>& destination);
     ModelEntry getSelectedModel() const;
     juce::StringArray makeRenderArguments(const juce::File& inputFile, const juce::File& outputFile, const ModelEntry& model) const;
     static juce::File findBundledRuntimeRoot();
@@ -100,6 +155,7 @@ private:
 
     std::vector<ModelEntry> models;
     std::atomic<int> selectedModelIndex { 0 };
+    std::atomic<bool> selectedModelUnavailable { false };
     std::atomic<int> pitchShiftSemitones { 0 };
     static std::atomic<int> sharedSelectedModelIndex;
 
@@ -109,21 +165,46 @@ private:
     int capturedSamples = 0;
     std::atomic<int> capturedSamplesAtomic { 0 };
     std::atomic<bool> captureActive { false };
+    std::atomic<bool> captureStarted { false };
     std::atomic<bool> captureOverflowed { false };
+    std::atomic<bool> captureDiscontinuity { false };
     std::atomic<juce::int64> captureStartHostSample { -1 };
+    std::atomic<double> captureSampleRate { 0.0 };
+
+    mutable juce::CriticalSection sessionLock;
+    juce::String sessionId;
+    juce::File sessionCaptureFile;
+    juce::File sessionRenderFile;
+    int sessionRenderSequence = 0;
+    juce::String unavailableSelectedModelId;
+    juce::String renderedModelId;
+    int renderedPitch = 0;
+    double sessionRenderedSampleRate = 0.0;
+    int sessionRenderedPlayableSamples = 0;
+    std::atomic<bool> captureSessionSaved { false };
+    std::atomic<bool> captureSessionSaveInProgress { false };
+    std::shared_ptr<BackgroundState> backgroundState = std::make_shared<BackgroundState>();
 
     mutable juce::CriticalSection renderedLock;
+    mutable juce::CriticalSection messageLock;
     juce::AudioBuffer<float> renderedAudio;
     int renderedPlaybackPosition = 0;
     int renderedPlayableSamples = 0;
+    double renderedSampleRate = 0.0;
     std::array<float, 2> lastRenderedOutputSample { 0.0f, 0.0f };
     std::atomic<bool> renderedPlaybackWasAudible { false };
     std::atomic<bool> renderInProgress { false };
     std::atomic<bool> renderReady { false };
     std::atomic<bool> renderFailed { false };
+    std::atomic<bool> renderCancelRequested { false };
+    std::atomic<float> renderProgress { 0.0f };
+    std::atomic<int> renderGeneration { 0 };
+    std::atomic<int> sampleRateAdaptationThreads { 0 };
+    mutable juce::CriticalSection renderProcessLock;
+    std::shared_ptr<juce::ChildProcess> activeRenderProcess;
     juce::String renderMessage;
 
-    double currentSampleRate = 44100.0;
+    std::atomic<double> currentSampleRate { 44100.0 };
     juce::AudioBuffer<float> pdcDryDelayBuffer;
     juce::AudioBuffer<float> pdcDelayedDryBlock;
     int pdcDryDelayPosition = 0;
@@ -132,5 +213,5 @@ private:
     int bypassFadeLengthSamples = 1;
     float bypassDryMix = 0.0f;
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(JkRvcAudioProcessor)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(RvcAudioProcessor)
 };

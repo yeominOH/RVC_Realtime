@@ -8,12 +8,12 @@
 #include <memory>
 #include <optional>
 
-class JkRvcAudioProcessorEditor final : public juce::AudioProcessorEditor,
+class RvcAudioProcessorEditor final : public juce::AudioProcessorEditor,
                                         private juce::Timer
 {
 public:
-    explicit JkRvcAudioProcessorEditor(JkRvcAudioProcessor&);
-    ~JkRvcAudioProcessorEditor() override = default;
+    explicit RvcAudioProcessorEditor(RvcAudioProcessor&);
+    ~RvcAudioProcessorEditor() override = default;
 
     void paint(juce::Graphics&) override;
     void resized() override;
@@ -23,8 +23,8 @@ private:
     void publishUiState();
     std::optional<juce::WebBrowserComponent::Resource> getResource(const juce::String& path) const;
 
-    JkRvcAudioProcessor& audioProcessor;
+    RvcAudioProcessor& audioProcessor;
     std::unique_ptr<juce::WebBrowserComponent> webView;
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(JkRvcAudioProcessorEditor)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(RvcAudioProcessorEditor)
 };

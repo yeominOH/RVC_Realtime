@@ -14,11 +14,9 @@ std::vector<std::byte> copyResource(const char* data, int size)
 }
 }
 
-JkRvcAudioProcessorEditor::JkRvcAudioProcessorEditor(JkRvcAudioProcessor& p)
+RvcAudioProcessorEditor::RvcAudioProcessorEditor(RvcAudioProcessor& p)
     : AudioProcessorEditor(&p), audioProcessor(p)
 {
-    audioProcessor.requestModelPreload();
-
     auto options = juce::WebBrowserComponent::Options{}
         .withNativeIntegrationEnabled()
         .withKeepPageLoadedWhenBrowserIsHidden()
@@ -39,9 +37,23 @@ JkRvcAudioProcessorEditor::JkRvcAudioProcessorEditor(JkRvcAudioProcessor& p)
                 parameter->endChangeGesture();
             }
         })
+        .withEventListener("toggleCapture", [this] (const juce::var&)
+        {
+            if (audioProcessor.isCapturing())
+                audioProcessor.stopCapture();
+            else
+                audioProcessor.startCapture();
+        })
+        .withEventListener("toggleTransform", [this] (const juce::var&)
+        {
+            if (audioProcessor.isRendering())
+                audioProcessor.cancelManualRender();
+            else
+                audioProcessor.startManualRender();
+        })
         .withEventListener("releaseKeyboardFocus", [this] (const juce::var&)
         {
-            juce::Component::SafePointer<JkRvcAudioProcessorEditor> safeThis(this);
+            juce::Component::SafePointer<RvcAudioProcessorEditor> safeThis(this);
             juce::MessageManager::callAsync([safeThis]
             {
                 if (auto* editor = safeThis.getComponent())
@@ -72,23 +84,23 @@ JkRvcAudioProcessorEditor::JkRvcAudioProcessorEditor(JkRvcAudioProcessor& p)
     startTimerHz(12);
 }
 
-void JkRvcAudioProcessorEditor::paint(juce::Graphics& g)
+void RvcAudioProcessorEditor::paint(juce::Graphics& g)
 {
     g.fillAll(juce::Colour(0xfff8f4ec));
 }
 
-void JkRvcAudioProcessorEditor::resized()
+void RvcAudioProcessorEditor::resized()
 {
     if (webView != nullptr)
         webView->setBounds(getLocalBounds());
 }
 
-void JkRvcAudioProcessorEditor::timerCallback()
+void RvcAudioProcessorEditor::timerCallback()
 {
     publishUiState();
 }
 
-void JkRvcAudioProcessorEditor::publishUiState()
+void RvcAudioProcessorEditor::publishUiState()
 {
     if (webView == nullptr)
         return;
@@ -99,9 +111,14 @@ void JkRvcAudioProcessorEditor::publishUiState()
     state->setProperty("pitch", audioProcessor.getPitchShiftSemitones());
     state->setProperty("enabled", enabled);
     state->setProperty("selectedModel", audioProcessor.getSelectedModelIndex());
-    state->setProperty("engineStatus", audioProcessor.getEngineStatus());
-    state->setProperty("modelLoaded", audioProcessor.isModelReady());
-    state->setProperty("vocalDetected", audioProcessor.getLastVocalDetected());
+    state->setProperty("capturing", audioProcessor.isCapturing());
+    state->setProperty("hasCapture", audioProcessor.hasCapturedAudio());
+    state->setProperty("captureSeconds", audioProcessor.getCapturedSeconds());
+    state->setProperty("captureStatus", audioProcessor.getCaptureStatus());
+    state->setProperty("rendering", audioProcessor.isRendering());
+    state->setProperty("hasRender", audioProcessor.hasRenderedAudio());
+    state->setProperty("renderProgress", audioProcessor.getRenderProgress());
+    state->setProperty("renderStatus", audioProcessor.getRenderStatus());
 
     juce::Array<juce::var> models;
     for (int i = 0; i < audioProcessor.getModelCount(); ++i)
@@ -112,7 +129,7 @@ void JkRvcAudioProcessorEditor::publishUiState()
 }
 
 std::optional<juce::WebBrowserComponent::Resource>
-JkRvcAudioProcessorEditor::getResource(const juce::String& path) const
+RvcAudioProcessorEditor::getResource(const juce::String& path) const
 {
     if (path == "/" || path == "/index.html")
         return juce::WebBrowserComponent::Resource {

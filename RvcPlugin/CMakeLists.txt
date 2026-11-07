@@ -2,7 +2,9 @@ cmake_minimum_required(VERSION 3.22)
 
 set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "Minimum macOS version for packaged apps and plugins")
 
-project(JkRvcPlugin VERSION 0.1.0)
+project(RvcPlugin VERSION 0.1.0)
+
+option(RVC_DEBUG_LOG "Enable temporary RVC lifecycle debug logging" ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -21,9 +23,9 @@ juce_add_binary_data(RvcWebAssets
         ../GUI/pitch_slider_thumb.png
         Runtime/rvc_stream_worker.py)
 
-juce_add_plugin(JkRvcPlugin
-    COMPANY_NAME "RVC_ONNX"
-    BUNDLE_ID "com.rvc-onnx.jkrvc"
+juce_add_plugin(RvcPlugin
+    COMPANY_NAME "Noctave"
+    BUNDLE_ID "com.rvc-onnx.rvc"
     PLUGIN_MANUFACTURER_CODE Rvco
     PLUGIN_CODE Jrvc
     FORMATS AU
@@ -35,19 +37,20 @@ juce_add_plugin(JkRvcPlugin
     IS_MIDI_EFFECT FALSE
     COPY_PLUGIN_AFTER_BUILD TRUE)
 
-target_sources(JkRvcPlugin
+target_sources(RvcPlugin
     PRIVATE
         Source/PluginProcessor.cpp
         Source/PluginEditor.cpp
         Source/RvcEngine.cpp)
 
-target_compile_definitions(JkRvcPlugin
+target_compile_definitions(RvcPlugin
     PUBLIC
         JUCE_WEB_BROWSER=1
         JUCE_USE_CURL=0
+        RVC_DEBUG_LOG=$<BOOL:${RVC_DEBUG_LOG}>
         RVC_ENABLE_ONNXRUNTIME=0)
 
-target_link_libraries(JkRvcPlugin
+target_link_libraries(RvcPlugin
     PRIVATE
         RvcWebAssets
         juce::juce_audio_utils
@@ -59,5 +62,5 @@ target_link_libraries(JkRvcPlugin
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags)
 
-set_target_properties(JkRvcPlugin PROPERTIES
+set_target_properties(RvcPlugin PROPERTIES
     XCODE_ATTRIBUTE_LD_RUNPATH_SEARCH_PATHS "@loader_path/../Frameworks")
