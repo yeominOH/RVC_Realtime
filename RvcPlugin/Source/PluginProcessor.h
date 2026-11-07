@@ -120,6 +120,7 @@ private:
     void loadModelChoices();
     int findModelIndexById(const juce::String& id) const;
     juce::String getModelIdForIndex(int index) const;
+    juce::String getReadyRenderMessage() const;
     void appendInputToCaptureBuffer(const juce::AudioBuffer<float>& buffer);
     void invalidateRenderedAudio(const juce::String& nextMessage);
     void adaptRenderedAudioToSampleRate(double targetSampleRate);
@@ -154,6 +155,7 @@ private:
 
     std::vector<ModelEntry> models;
     std::atomic<int> selectedModelIndex { 0 };
+    std::atomic<bool> selectedModelUnavailable { false };
     std::atomic<int> pitchShiftSemitones { 0 };
     static std::atomic<int> sharedSelectedModelIndex;
 
@@ -174,6 +176,7 @@ private:
     juce::File sessionCaptureFile;
     juce::File sessionRenderFile;
     int sessionRenderSequence = 0;
+    juce::String unavailableSelectedModelId;
     juce::String renderedModelId;
     int renderedPitch = 0;
     double sessionRenderedSampleRate = 0.0;
