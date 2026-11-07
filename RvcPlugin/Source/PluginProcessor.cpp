@@ -269,8 +269,11 @@ void RvcAudioProcessor::setSelectedModelIndex(int index)
     if (index < 0 || index >= (int) models.size())
         return;
 
-    selectedModelIndex.store(index);
+    const auto previousIndex = selectedModelIndex.exchange(index);
     sharedSelectedModelIndex.store(index);
+    if (previousIndex == index)
+        return;
+
     if (renderInProgress.load())
         cancelManualRender();
     invalidateRenderedAudio(hasCapturedAudio() ? "Model changed - transform again"
