@@ -79,6 +79,21 @@ private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameters();
     void timerCallback() override;
     void trimCaptureBufferToLength();
+    void createNewSession();
+    static juce::File getSessionsRoot();
+    static juce::File getSessionDirectory(const juce::String& id);
+    static bool writeFloatWavFile(const juce::File& file,
+                                  const juce::AudioBuffer<float>& audio,
+                                  int numSamples,
+                                  double sampleRate);
+    static bool writeNewSessionRenderFile(const juce::String& id,
+                                          const juce::AudioBuffer<float>& audio,
+                                          double sampleRate,
+                                          juce::File& destination,
+                                          int& sequence);
+    static bool readFloatWavFile(const juce::File& file,
+                                 juce::AudioBuffer<float>& destination,
+                                 double& sampleRate);
     void loadModelChoices();
     void appendInputToCaptureBuffer(const juce::AudioBuffer<float>& buffer);
     void invalidateRenderedAudio(const juce::String& nextMessage);
@@ -128,6 +143,14 @@ private:
     std::atomic<bool> captureDiscontinuity { false };
     std::atomic<juce::int64> captureStartHostSample { -1 };
     std::atomic<double> captureSampleRate { 0.0 };
+
+    mutable juce::CriticalSection sessionLock;
+    juce::String sessionId;
+    juce::File sessionCaptureFile;
+    juce::File sessionRenderFile;
+    int sessionRenderSequence = 0;
+    int renderedModelIndex = -1;
+    int renderedPitch = 0;
 
     mutable juce::CriticalSection renderedLock;
     mutable juce::CriticalSection messageLock;

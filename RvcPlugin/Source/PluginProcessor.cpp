@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #if JUCE_MAC
 #include <dlfcn.h>
@@ -46,6 +47,37 @@ void writeRvcDebugLog(const void* instance,
 #else
 #define RVC_WRITE_DEBUG_LOG(instance, eventName, details) do {} while (false)
 #endif
+
+juce::CriticalSection& getSessionStorageLock()
+{
+    static juce::CriticalSection lock;
+    return lock;
+}
+
+bool writeFloatWavFileUnlocked(const juce::File& file,
+                               const juce::AudioBuffer<float>& audio,
+                               int numSamples,
+                               double sampleRate)
+{
+    if (audio.getNumChannels() <= 0 || numSamples <= 0 || sampleRate <= 0.0)
+        return false;
+
+    std::unique_ptr<juce::OutputStream> stream = file.createOutputStream();
+    if (stream == nullptr)
+        return false;
+
+    juce::WavAudioFormat wav;
+    const auto writerOptions = juce::AudioFormatWriter::Options {}
+                                   .withSampleRate(sampleRate)
+                                   .withNumChannels(audio.getNumChannels())
+                                   .withBitsPerSample(32);
+    auto writer = wav.createWriterFor(stream, writerOptions);
+    if (writer == nullptr)
+        return false;
+
+    return writer->writeFromAudioSampleBuffer(
+        audio, 0, juce::jmin(numSamples, audio.getNumSamples()));
+}
 }
 
 std::atomic<int> RvcAudioProcessor::sharedSelectedModelIndex { 0 };
@@ -392,10 +424,110 @@ juce::String RvcAudioProcessor::getCaptureStatus() const
     return "Capture idle";
 }
 
+juce::File RvcAudioProcessor::getSessionsRoot()
+{
+    return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+        .getChildFile("RVC")
+        .getChildFile("Sessions");
+}
+
+juce::File RvcAudioProcessor::getSessionDirectory(const juce::String& id)
+{
+    return getSessionsRoot().getChildFile(id);
+}
+
+void RvcAudioProcessor::createNewSession()
+{
+    const auto newSessionId = juce::Uuid().toString();
+    const auto directory = getSessionDirectory(newSessionId);
+    directory.createDirectory();
+
+    const juce::ScopedLock lock(sessionLock);
+    sessionId = newSessionId;
+    sessionCaptureFile = directory.getChildFile("capture.wav");
+    sessionRenderFile = juce::File();
+    sessionRenderSequence = 0;
+    renderedModelIndex = -1;
+    renderedPitch = 0;
+}
+
+bool RvcAudioProcessor::writeFloatWavFile(const juce::File& file,
+                                          const juce::AudioBuffer<float>& audio,
+                                          int numSamples,
+                                          double sampleRate)
+{
+    const juce::ScopedLock lock(getSessionStorageLock());
+    if (file.existsAsFile())
+        return true;
+
+    if (! file.getParentDirectory().createDirectory())
+        return false;
+
+    return writeFloatWavFileUnlocked(file, audio, numSamples, sampleRate);
+}
+
+bool RvcAudioProcessor::writeNewSessionRenderFile(const juce::String& id,
+                                                   const juce::AudioBuffer<float>& audio,
+                                                   double sampleRate,
+                                                   juce::File& destination,
+                                                   int& sequence)
+{
+    const juce::ScopedLock lock(getSessionStorageLock());
+    const auto directory = getSessionDirectory(id);
+    if (! directory.createDirectory())
+        return false;
+
+    auto nextSequence = 1;
+    for (const auto& file : directory.findChildFiles(juce::File::findFiles, false,
+                                                     "render_*.wav"))
+    {
+        const auto number = file.getFileNameWithoutExtension()
+                                .fromFirstOccurrenceOf("render_", false, false)
+                                .getIntValue();
+        nextSequence = juce::jmax(nextSequence, number + 1);
+    }
+
+    const auto nextFile = directory.getChildFile("render_" + juce::String(nextSequence) + ".wav");
+    if (! writeFloatWavFileUnlocked(nextFile, audio, audio.getNumSamples(), sampleRate))
+        return false;
+
+    destination = nextFile;
+    sequence = nextSequence;
+    return true;
+}
+
+bool RvcAudioProcessor::readFloatWavFile(const juce::File& file,
+                                         juce::AudioBuffer<float>& destination,
+                                         double& sampleRate)
+{
+    const juce::ScopedLock lock(getSessionStorageLock());
+    auto stream = file.createInputStream();
+    if (stream == nullptr)
+        return false;
+
+    juce::WavAudioFormat wav;
+    std::unique_ptr<juce::AudioFormatReader> reader(
+        wav.createReaderFor(stream.release(), true));
+    if (reader == nullptr || reader->lengthInSamples <= 0
+        || reader->lengthInSamples > std::numeric_limits<int>::max())
+        return false;
+
+    juce::AudioBuffer<float> loaded((int) reader->numChannels,
+                                    (int) reader->lengthInSamples);
+    if (! reader->read(&loaded, 0, loaded.getNumSamples(), 0, true, true))
+        return false;
+
+    sampleRate = reader->sampleRate;
+    destination = std::move(loaded);
+    return sampleRate > 0.0;
+}
+
 void RvcAudioProcessor::startCapture()
 {
     if (renderInProgress.load())
         cancelManualRender();
+
+    createNewSession();
 
     const juce::ScopedLock lock(captureLock);
     const auto sampleRate = currentSampleRate.load();
