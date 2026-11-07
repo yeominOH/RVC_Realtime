@@ -90,6 +90,7 @@ private:
 
     struct ModelEntry
     {
+        juce::String id;
         juce::String name;
         juce::File onnxFile;
         juce::File pthFile;
@@ -117,6 +118,8 @@ private:
                                  juce::AudioBuffer<float>& destination,
                                  double& sampleRate);
     void loadModelChoices();
+    int findModelIndexById(const juce::String& id) const;
+    juce::String getModelIdForIndex(int index) const;
     void appendInputToCaptureBuffer(const juce::AudioBuffer<float>& buffer);
     void invalidateRenderedAudio(const juce::String& nextMessage);
     void adaptRenderedAudioToSampleRate(double targetSampleRate);
@@ -171,7 +174,7 @@ private:
     juce::File sessionCaptureFile;
     juce::File sessionRenderFile;
     int sessionRenderSequence = 0;
-    int renderedModelIndex = -1;
+    juce::String renderedModelId;
     int renderedPitch = 0;
     double sessionRenderedSampleRate = 0.0;
     int sessionRenderedPlayableSamples = 0;

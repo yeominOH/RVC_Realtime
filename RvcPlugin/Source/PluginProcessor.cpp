@@ -347,7 +347,10 @@ void RvcAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
                         + ", rvcEnabled="
                         + juce::String((int) (state.getRawParameterValue("rvcEnabled")->load() > 0.5f)));
     auto snapshot = state.copyState();
-    snapshot.setProperty("selectedModelIndex", selectedModelIndex.load(), nullptr);
+    snapshot.removeProperty("selectedModelIndex", nullptr);
+    snapshot.removeProperty("renderedModelIndex", nullptr);
+    snapshot.setProperty("selectedModelId",
+                         getModelIdForIndex(selectedModelIndex.load()), nullptr);
     snapshot.setProperty("pitchShiftSemitones", pitchShiftSemitones.load(), nullptr);
     {
         const juce::ScopedLock lock(sessionLock);
@@ -359,7 +362,7 @@ void RvcAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
         snapshot.setProperty("renderFile", sessionRenderFile.getFileName(), nullptr);
         snapshot.setProperty("renderedSampleRate", sessionRenderedSampleRate, nullptr);
         snapshot.setProperty("renderedPlayableSamples", sessionRenderedPlayableSamples, nullptr);
-        snapshot.setProperty("renderedModelIndex", renderedModelIndex, nullptr);
+        snapshot.setProperty("renderedModelId", renderedModelId, nullptr);
         snapshot.setProperty("renderedPitch", renderedPitch, nullptr);
     }
     if (auto xml = snapshot.createXml())
@@ -373,7 +376,8 @@ void RvcAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
     if (auto xml = getXmlFromBinary(data, sizeInBytes))
     {
         auto restored = juce::ValueTree::fromXml(*xml);
-        const auto restoredModel = (int) restored.getProperty("selectedModelIndex", 0);
+        const auto restoredSelectedModelId = restored.getProperty("selectedModelId").toString();
+        const auto legacySelectedModel = (int) restored.getProperty("selectedModelIndex", 0);
         const auto restoredPitch = (int) restored.getProperty("pitchShiftSemitones", 0);
         const auto restoredSessionId = restored.getProperty("sessionId").toString();
         auto captureFileName = restored.getProperty("captureFile").toString();
@@ -385,14 +389,51 @@ void RvcAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
         const auto restoredRenderRate = (double) restored.getProperty("renderedSampleRate", 0.0);
         const auto restoredPlayableSamples = (int) restored.getProperty(
             "renderedPlayableSamples", 0);
-        const auto restoredRenderedModel = (int) restored.getProperty("renderedModelIndex", -1);
+        auto restoredRenderedModelId = restored.getProperty("renderedModelId").toString();
+        const auto legacyRenderedModel = (int) restored.getProperty("renderedModelIndex", -1);
         const auto restoredRenderedPitch = (int) restored.getProperty("renderedPitch", 0);
 
         state.replaceState(restored);
 
-        const auto validModel = models.empty()
-                              ? 0
-                              : juce::jlimit(0, (int) models.size() - 1, restoredModel);
+        auto validModel = 0;
+        auto modelNotFound = false;
+        if (! models.empty())
+        {
+            if (restoredSelectedModelId.isNotEmpty())
+            {
+                validModel = findModelIndexById(restoredSelectedModelId);
+                if (validModel < 0)
+                {
+                    validModel = 0;
+                    modelNotFound = true;
+                }
+            }
+            else if (legacySelectedModel >= 0
+                     && legacySelectedModel < (int) models.size())
+            {
+                validModel = legacySelectedModel;
+            }
+            else
+            {
+                validModel = 0;
+                modelNotFound = true;
+            }
+
+            if (restoredRenderedModelId.isEmpty()
+                && legacyRenderedModel >= 0
+                && legacyRenderedModel < (int) models.size())
+                restoredRenderedModelId = getModelIdForIndex(legacyRenderedModel);
+        }
+        else if (restoredSelectedModelId.isNotEmpty()
+                 || restored.hasProperty("selectedModelIndex"))
+        {
+            modelNotFound = true;
+        }
+
+        const auto validModelId = getModelIdForIndex(validModel);
+        if (restoredRenderedModelId.isNotEmpty()
+            && findModelIndexById(restoredRenderedModelId) < 0)
+            modelNotFound = true;
         const auto validPitch = juce::jlimit(-24, 24, restoredPitch);
         selectedModelIndex.store(validModel);
         sharedSelectedModelIndex.store(validModel);
@@ -400,7 +441,14 @@ void RvcAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
 
         // Older states have no persisted session and keep the normal empty state.
         if (restoredSessionId.isEmpty())
+        {
+            if (modelNotFound)
+            {
+                const juce::ScopedLock lock(messageLock);
+                renderMessage = "Model not found - choose a model";
+            }
             return;
+        }
 
         const auto allowedSessionCharacters = restoredSessionId.retainCharacters(
             "0123456789abcdefABCDEF-");
@@ -414,7 +462,7 @@ void RvcAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
         }
 
         auto matchesInMemorySession = false;
-        auto inMemoryRenderedModel = -1;
+        juce::String inMemoryRenderedModelId;
         auto inMemoryRenderedPitch = 0;
         {
             const juce::ScopedLock lock(sessionLock);
@@ -422,7 +470,7 @@ void RvcAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
                                   && capturedSamplesAtomic.load() > 0;
             if (matchesInMemorySession)
             {
-                inMemoryRenderedModel = renderedModelIndex;
+                inMemoryRenderedModelId = renderedModelId;
                 inMemoryRenderedPitch = renderedPitch;
             }
         }
@@ -439,10 +487,10 @@ void RvcAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
             }
 
             const auto modelChanged = hasRenderedMemory
-                                   && validModel != inMemoryRenderedModel;
+                                   && validModelId != inMemoryRenderedModelId;
             const auto pitchChanged = hasRenderedMemory
                                    && validPitch != inMemoryRenderedPitch;
-            if (modelChanged || pitchChanged)
+            if (modelNotFound || modelChanged || pitchChanged)
             {
                 if (renderInProgress.load())
                     cancelManualRender();
@@ -454,8 +502,9 @@ void RvcAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
                 renderProgress.store(0.0f);
                 renderedPlaybackWasAudible.store(false);
                 const juce::ScopedLock lock(messageLock);
-                renderMessage = modelChanged ? "Model changed - transform again"
-                                             : "Pitch changed - transform again";
+                renderMessage = modelNotFound ? "Model not found - choose a model"
+                    : (modelChanged ? "Model changed - transform again"
+                                    : "Pitch changed - transform again");
             }
             else if (! captureActive.load() && ! renderInProgress.load()
                      && sampleRateAdaptationThreads.load() <= 0)
@@ -529,7 +578,7 @@ void RvcAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
             sessionRenderFile = renderFile;
             sessionRenderSequence = renderFileName.fromFirstOccurrenceOf(
                 "render_", false, false).upToLastOccurrenceOf(".", false, false).getIntValue();
-            renderedModelIndex = restoredRenderedModel;
+            renderedModelId = restoredRenderedModelId;
             renderedPitch = restoredRenderedPitch;
             sessionRenderedSampleRate = restoredRenderRate;
             sessionRenderedPlayableSamples = restoredPlayableSamples;
@@ -549,15 +598,17 @@ void RvcAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
         const auto launched = juce::Thread::launch(
             [background, restoredSessionId, captureFile, renderFile,
              restoredCaptureRate, restoredCaptureStart, restoredCapturedSamples,
-             restoredRenderRate, restoredPlayableSamples, restoredRenderedModel,
-             restoredRenderedPitch, validModel, validPitch, generation]() mutable
+             restoredRenderRate, restoredPlayableSamples, restoredRenderedModelId,
+             restoredRenderedPitch, validModelId, validPitch, modelNotFound,
+             generation]() mutable
             {
                 juce::AudioBuffer<float> loadedCapture;
                 auto captureFileRate = 0.0;
                 const auto captureLoaded = readFloatWavFile(
                     captureFile, loadedCapture, captureFileRate);
 
-                const auto renderMatchesParameters = restoredRenderedModel == validModel
+                const auto renderMatchesParameters = ! modelNotFound
+                                                   && restoredRenderedModelId == validModelId
                                                    && restoredRenderedPitch == validPitch;
                 juce::AudioBuffer<float> loadedRender;
                 auto renderFileRate = 0.0;
@@ -635,7 +686,9 @@ void RvcAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
                     }
 
                     juce::String finalMessage;
-                    if (restoredRenderedModel != validModel)
+                    if (modelNotFound)
+                        finalMessage = "Model not found - choose a model";
+                    else if (restoredRenderedModelId != validModelId)
                         finalMessage = "Model changed - transform again";
                     else if (restoredRenderedPitch != validPitch)
                         finalMessage = "Pitch changed - transform again";
@@ -796,7 +849,7 @@ void RvcAudioProcessor::createNewSession()
     sessionCaptureFile = directory.getChildFile("capture.wav");
     sessionRenderFile = juce::File();
     sessionRenderSequence = 0;
-    renderedModelIndex = -1;
+    renderedModelId.clear();
     renderedPitch = 0;
     sessionRenderedSampleRate = 0.0;
     sessionRenderedPlayableSamples = 0;
@@ -1140,7 +1193,7 @@ void RvcAudioProcessor::invalidateRenderedAudio(const juce::String& nextMessage)
         const juce::ScopedLock lock(sessionLock);
         sessionRenderFile = juce::File();
         sessionRenderSequence = 0;
-        renderedModelIndex = -1;
+        renderedModelId.clear();
         renderedPitch = 0;
         sessionRenderedSampleRate = 0.0;
         sessionRenderedPlayableSamples = 0;
@@ -1477,6 +1530,7 @@ juce::String RvcAudioProcessor::getRenderStatus() const
     const juce::ScopedLock lock(messageLock);
 
     if (renderMessage == "Model changed - transform again"
+        || renderMessage == "Model not found - choose a model"
         || renderMessage == "Pitch changed - transform again"
         || renderMessage == "Transform cancelled"
         || renderMessage == "Transform again")
@@ -1580,7 +1634,7 @@ void RvcAudioProcessor::startManualRender()
 
     const auto outputFile = inputFile.getSiblingFile(inputFile.getFileNameWithoutExtension() + "_rendered.wav");
     const auto args = makeRenderArguments(inputFile, outputFile, model);
-    const auto modelIndexForRender = selectedModelIndex.load();
+    const auto modelIdForRender = model.id;
     const auto pitchForRender = pitchShiftSemitones.load();
     juce::String sessionIdForRender;
     {
@@ -1593,7 +1647,7 @@ void RvcAudioProcessor::startManualRender()
     const auto launched = juce::Thread::launch([background, args, inputFile, outputFile,
                                                  playableSamplesToRender, capturedAtSampleRate,
                                                  generation, sessionIdForRender,
-                                                 modelIndexForRender, pitchForRender]
+                                                 modelIdForRender, pitchForRender]
     {
         bool ok = false;
         juce::String processOutput;
@@ -1780,7 +1834,7 @@ void RvcAudioProcessor::startManualRender()
                     {
                         processor.sessionRenderFile = savedRenderFile;
                         processor.sessionRenderSequence = savedSequence;
-                        processor.renderedModelIndex = modelIndexForRender;
+                        processor.renderedModelId = modelIdForRender;
                         processor.renderedPitch = pitchForRender;
                         processor.sessionRenderedSampleRate = loadedSampleRate;
                         processor.sessionRenderedPlayableSamples = committedPlayableSamples;
@@ -2004,6 +2058,7 @@ void RvcAudioProcessor::loadModelChoices()
             continue;
 
         ModelEntry model;
+        model.id = folder.getFileName();
         model.name = folder.getFileName();
         model.onnxFile = findFirstRecursive(folder, "*.onnx");
         model.pthFile = findFirstRecursive(folder, "*.pth");
@@ -2012,6 +2067,23 @@ void RvcAudioProcessor::loadModelChoices()
         if (model.onnxFile.existsAsFile() && model.pthFile.existsAsFile())
             models.push_back(model);
     }
+}
+
+int RvcAudioProcessor::findModelIndexById(const juce::String& id) const
+{
+    for (size_t i = 0; i < models.size(); ++i)
+        if (models[i].id == id)
+            return (int) i;
+
+    return -1;
+}
+
+juce::String RvcAudioProcessor::getModelIdForIndex(int index) const
+{
+    if (index >= 0 && index < (int) models.size())
+        return models[(size_t) index].id;
+
+    return {};
 }
 
 RvcAudioProcessor::ModelEntry RvcAudioProcessor::getSelectedModel() const

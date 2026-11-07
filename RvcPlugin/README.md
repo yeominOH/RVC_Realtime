@@ -86,3 +86,4 @@ Run these scenarios in the DAW after building and installing the AU:
 7. Transform captured audio, save the Logic project, quit Logic, reopen the project, and replay. Confirm that the transformed result is restored automatically.
 8. Transform captured audio and duplicate the track. Confirm that both tracks play their result, then start a new capture on one track and confirm that the other track's result is unchanged.
 9. Save a project with a transformed result, quit Logic, manually remove that session's folder from `~/Library/Application Support/RVC/Sessions`, and reopen the project. Confirm that the plug-in does not crash and displays `Session audio missing - capture again`.
+10. Transform captured audio and save the project. Add a new model folder under `Models`, reopen the project, and confirm that the originally selected model and its transformed result are retained even if the model sort order changes.
