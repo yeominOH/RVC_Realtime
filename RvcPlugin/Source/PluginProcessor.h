@@ -68,6 +68,26 @@ public:
     juce::String getRenderStatus() const;
 
 private:
+    struct BackgroundState
+    {
+        juce::CriticalSection ownerLock;
+        RvcAudioProcessor* owner = nullptr;
+        std::atomic<int> activeTasks { 0 };
+        std::atomic<int> renderTasks { 0 };
+    };
+
+    template <typename Callback>
+    static bool withBackgroundProcessor(const std::shared_ptr<BackgroundState>& background,
+                                        Callback&& callback)
+    {
+        const juce::ScopedLock lock(background->ownerLock);
+        if (background->owner == nullptr)
+            return false;
+
+        callback(*background->owner);
+        return true;
+    }
+
     struct ModelEntry
     {
         juce::String name;
@@ -157,7 +177,7 @@ private:
     int sessionRenderedPlayableSamples = 0;
     std::atomic<bool> captureSessionSaved { false };
     std::atomic<bool> captureSessionSaveInProgress { false };
-    std::atomic<int> sessionBackgroundTasks { 0 };
+    std::shared_ptr<BackgroundState> backgroundState = std::make_shared<BackgroundState>();
 
     mutable juce::CriticalSection renderedLock;
     mutable juce::CriticalSection messageLock;

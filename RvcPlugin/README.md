@@ -82,3 +82,7 @@ Run these scenarios in the DAW after building and installing the AU:
 3. At 48 kHz, capture audio. Change the DAW sample rate to 44.1 kHz before pressing `TRANSFORM`, then transform and replay it. Confirm normal pitch and speed.
 4. Press `CAPTURE`, then select another track or change the DAW buffer size before playback. Start playback and confirm that capture begins normally without having to arm it again.
 5. With a transformed result ready at 48 kHz, change the DAW sample rate to 44.1 kHz and immediately return it to 48 kHz. Replay the captured timeline and confirm that the transformed result plays normally.
+6. Transform captured audio, change only the DAW buffer size, and replay. Confirm that the restored result remains available and aligned after Logic recreates the plug-in instance.
+7. Transform captured audio, save the Logic project, quit Logic, reopen the project, and replay. Confirm that the transformed result is restored automatically.
+8. Transform captured audio and duplicate the track. Confirm that both tracks play their result, then start a new capture on one track and confirm that the other track's result is unchanged.
+9. Save a project with a transformed result, quit Logic, manually remove that session's folder from `~/Library/Application Support/RVC/Sessions`, and reopen the project. Confirm that the plug-in does not crash and displays `Session audio missing - capture again`.
