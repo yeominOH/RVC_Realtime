@@ -5,12 +5,48 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 
 #if JUCE_MAC
 #include <dlfcn.h>
 #endif
+
+namespace
+{
+#if RVC_DEBUG_LOG
+void writeRvcDebugLog(const void* instance,
+                      const juce::String& eventName,
+                      const juce::String& details)
+{
+    static juce::CriticalSection logLock;
+    const juce::ScopedLock lock(logLock);
+
+    const auto logDirectory = juce::File::getSpecialLocation(juce::File::userHomeDirectory)
+                                  .getChildFile("Library")
+                                  .getChildFile("Logs")
+                                  .getChildFile("RVC");
+    if (! logDirectory.isDirectory() && ! logDirectory.createDirectory())
+        return;
+
+    juce::String line;
+    line << juce::Time::currentTimeMillis()
+         << " | instance=0x"
+         << juce::String::toHexString((juce::int64) reinterpret_cast<std::uintptr_t>(instance))
+         << " | event=" << eventName;
+    if (details.isNotEmpty())
+        line << " | " << details;
+
+    logDirectory.getChildFile("rvc_debug.log").appendText(line + "\n", false, false, "\n");
+}
+
+#define RVC_WRITE_DEBUG_LOG(instance, eventName, details) \
+    writeRvcDebugLog(instance, eventName, details)
+#else
+#define RVC_WRITE_DEBUG_LOG(instance, eventName, details) do {} while (false)
+#endif
+}
 
 std::atomic<int> RvcAudioProcessor::sharedSelectedModelIndex { 0 };
 
@@ -27,10 +63,16 @@ RvcAudioProcessor::RvcAudioProcessor()
         renderMessage = "Waiting for capture";
     }
     startTimerHz(4);
+    RVC_WRITE_DEBUG_LOG(this, "constructor",
+                        "models=" + juce::String((int) models.size()));
 }
 
 RvcAudioProcessor::~RvcAudioProcessor()
 {
+    RVC_WRITE_DEBUG_LOG(this, "destructor",
+                        "rendering=" + juce::String((int) renderInProgress.load())
+                        + ", adaptationThreads="
+                        + juce::String(sampleRateAdaptationThreads.load()));
     stopTimer();
     cancelManualRender();
     for (int i = 0; i < 500 && renderInProgress.load(); ++i)
@@ -54,6 +96,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout RvcAudioProcessor::createPar
 void RvcAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
     const auto newSampleRate = sampleRate > 0.0 ? sampleRate : 44100.0;
+    RVC_WRITE_DEBUG_LOG(this, "prepareToPlay",
+                        "sampleRate=" + juce::String(newSampleRate, 2)
+                        + ", samplesPerBlock=" + juce::String(samplesPerBlock));
     currentSampleRate.store(newSampleRate);
 
     if (captureActive.load())
@@ -97,6 +142,7 @@ void RvcAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 
 void RvcAudioProcessor::releaseResources()
 {
+    RVC_WRITE_DEBUG_LOG(this, "releaseResources", juce::String());
     captureActive.store(false);
     renderedPlaybackWasAudible.store(false);
 }
@@ -225,6 +271,11 @@ void RvcAudioProcessor::applyRvcBypassFade(juce::AudioBuffer<float>& wetBuffer,
 
 void RvcAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
+    RVC_WRITE_DEBUG_LOG(this, "getStateInformation",
+                        "model=" + juce::String(selectedModelIndex.load())
+                        + ", pitch=" + juce::String(pitchShiftSemitones.load())
+                        + ", rvcEnabled="
+                        + juce::String((int) (state.getRawParameterValue("rvcEnabled")->load() > 0.5f)));
     auto snapshot = state.copyState();
     snapshot.setProperty("selectedModelIndex", selectedModelIndex.load(), nullptr);
     snapshot.setProperty("pitchShiftSemitones", pitchShiftSemitones.load(), nullptr);
@@ -234,6 +285,8 @@ void RvcAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
 
 void RvcAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
 {
+    RVC_WRITE_DEBUG_LOG(this, "setStateInformation",
+                        "sizeInBytes=" + juce::String(sizeInBytes));
     if (auto xml = getXmlFromBinary(data, sizeInBytes))
     {
         auto restored = juce::ValueTree::fromXml(*xml);
@@ -267,10 +320,21 @@ juce::String RvcAudioProcessor::getModelName(int index) const
 void RvcAudioProcessor::setSelectedModelIndex(int index)
 {
     if (index < 0 || index >= (int) models.size())
+    {
+        RVC_WRITE_DEBUG_LOG(this, "setSelectedModelIndex",
+                            "previous=" + juce::String(selectedModelIndex.load())
+                            + ", requested=" + juce::String(index)
+                            + ", invalidate=false, valid=false");
         return;
+    }
 
     const auto previousIndex = selectedModelIndex.exchange(index);
     sharedSelectedModelIndex.store(index);
+    RVC_WRITE_DEBUG_LOG(this, "setSelectedModelIndex",
+                        "previous=" + juce::String(previousIndex)
+                        + ", new=" + juce::String(index)
+                        + ", invalidate="
+                        + juce::String(previousIndex == index ? "false" : "true"));
     if (previousIndex == index)
         return;
 
@@ -283,7 +347,13 @@ void RvcAudioProcessor::setSelectedModelIndex(int index)
 void RvcAudioProcessor::setPitchShiftSemitones(int semitones)
 {
     const auto clamped = juce::jlimit(-24, 24, semitones);
-    if (pitchShiftSemitones.exchange(clamped) == clamped)
+    const auto previousSemitones = pitchShiftSemitones.exchange(clamped);
+    RVC_WRITE_DEBUG_LOG(this, "setPitchShiftSemitones",
+                        "previous=" + juce::String(previousSemitones)
+                        + ", new=" + juce::String(clamped)
+                        + ", invalidate="
+                        + juce::String(previousSemitones == clamped ? "false" : "true"));
+    if (previousSemitones == clamped)
         return;
 
     if (renderInProgress.load())
@@ -443,6 +513,8 @@ void RvcAudioProcessor::appendInputToCaptureBuffer(const juce::AudioBuffer<float
 
 void RvcAudioProcessor::invalidateRenderedAudio(const juce::String& nextMessage)
 {
+    RVC_WRITE_DEBUG_LOG(this, "invalidateRenderedAudio",
+                        "message=" + nextMessage);
     {
         const juce::ScopedLock lock(renderedLock);
         renderGeneration.fetch_add(1);
@@ -468,6 +540,8 @@ void RvcAudioProcessor::adaptRenderedAudioToSampleRate(double targetSampleRate)
     double sourceSampleRate = 0.0;
     int sourcePlayableSamples = 0;
     int generation = 0;
+    const char* discardReason = nullptr;
+    auto restoredExistingResult = false;
 
     {
         const juce::ScopedLock lock(renderedLock);
@@ -487,23 +561,54 @@ void RvcAudioProcessor::adaptRenderedAudioToSampleRate(double targetSampleRate)
             renderedPlaybackWasAudible.store(false);
             const juce::ScopedLock messageGuard(messageLock);
             renderMessage = "Transform ready - press play";
-            return;
+            sourceSampleRate = renderedSampleRate;
+            restoredExistingResult = true;
         }
+        else
+        {
+            if (! hasRenderedAudio)
+                discardReason = "no-rendered-audio";
+            else if (renderedSampleRate <= 0.0)
+                discardReason = "invalid-rendered-sample-rate";
+            else if (alreadyAtTarget)
+                discardReason = "already-at-target";
+            else if (! renderReady.load() && sampleRateAdaptationThreads.load() <= 0)
+                discardReason = "no-valid-render-result";
+            else if (renderInProgress.load() && ! renderReady.load())
+                discardReason = "render-in-progress";
 
-        if (! hasRenderedAudio
-            || renderedSampleRate <= 0.0
-            || alreadyAtTarget
-            || (! renderReady.load() && sampleRateAdaptationThreads.load() <= 0)
-            || (renderInProgress.load() && ! renderReady.load()))
-            return;
-
-        generation = renderGeneration.fetch_add(1) + 1;
-        sourceAudio.makeCopyOf(renderedAudio);
-        sourceSampleRate = renderedSampleRate;
-        sourcePlayableSamples = renderedPlayableSamples;
-        renderReady.store(false);
-        sampleRateAdaptationThreads.fetch_add(1);
+            if (discardReason == nullptr)
+            {
+                generation = renderGeneration.fetch_add(1) + 1;
+                sourceAudio.makeCopyOf(renderedAudio);
+                sourceSampleRate = renderedSampleRate;
+                sourcePlayableSamples = renderedPlayableSamples;
+                renderReady.store(false);
+                sampleRateAdaptationThreads.fetch_add(1);
+            }
+        }
     }
+
+    if (restoredExistingResult)
+    {
+        RVC_WRITE_DEBUG_LOG(this, "adaptRenderedAudioToSampleRate.complete",
+                            "mode=restore-existing, sampleRate="
+                            + juce::String(sourceSampleRate, 2));
+        return;
+    }
+
+    if (discardReason != nullptr)
+    {
+        RVC_WRITE_DEBUG_LOG(this, "adaptRenderedAudioToSampleRate.discard",
+                            "reason=" + juce::String(discardReason)
+                            + ", targetSampleRate=" + juce::String(targetSampleRate, 2));
+        return;
+    }
+
+    RVC_WRITE_DEBUG_LOG(this, "adaptRenderedAudioToSampleRate.start",
+                        "sourceSampleRate=" + juce::String(sourceSampleRate, 2)
+                        + ", targetSampleRate=" + juce::String(targetSampleRate, 2)
+                        + ", generation=" + juce::String(generation));
 
     renderedPlaybackWasAudible.store(false);
     {
@@ -546,16 +651,36 @@ void RvcAudioProcessor::adaptRenderedAudioToSampleRate(double targetSampleRate)
             {
                 processor->renderedPlaybackWasAudible.store(false);
                 processor->renderFailed.store(false);
-                const juce::ScopedLock lock(processor->messageLock);
-                if (processor->renderGeneration.load() == generation)
-                    processor->renderMessage = "Transform ready - press play";
+                {
+                    const juce::ScopedLock lock(processor->messageLock);
+                    if (processor->renderGeneration.load() == generation)
+                        processor->renderMessage = "Transform ready - press play";
+                }
+                RVC_WRITE_DEBUG_LOG(processor, "adaptRenderedAudioToSampleRate.complete",
+                                    "sampleRate=" + juce::String(targetSampleRate, 2)
+                                    + ", generation=" + juce::String(generation));
             }
             else if (! ok && processor->renderGeneration.load() == generation)
             {
                 processor->renderFailed.store(true);
-                const juce::ScopedLock lock(processor->messageLock);
-                if (processor->renderGeneration.load() == generation)
-                    processor->renderMessage = "Sample rate adaptation failed";
+                {
+                    const juce::ScopedLock lock(processor->messageLock);
+                    if (processor->renderGeneration.load() == generation)
+                        processor->renderMessage = "Sample rate adaptation failed";
+                }
+                RVC_WRITE_DEBUG_LOG(processor, "adaptRenderedAudioToSampleRate.discard",
+                                    "reason=resample-failed, generation="
+                                    + juce::String(generation));
+            }
+            else
+            {
+                RVC_WRITE_DEBUG_LOG(processor, "adaptRenderedAudioToSampleRate.discard",
+                                    "reason=stale-generation-or-sample-rate, generation="
+                                    + juce::String(generation)
+                                    + ", currentGeneration="
+                                    + juce::String(processor->renderGeneration.load())
+                                    + ", currentSampleRate="
+                                    + juce::String(processor->currentSampleRate.load(), 2));
             }
 
             processor->sampleRateAdaptationThreads.fetch_sub(1);
@@ -565,9 +690,14 @@ void RvcAudioProcessor::adaptRenderedAudioToSampleRate(double targetSampleRate)
     {
         sampleRateAdaptationThreads.fetch_sub(1);
         renderFailed.store(true);
-        const juce::ScopedLock lock(messageLock);
-        if (renderGeneration.load() == generation)
-            renderMessage = "Could not start sample rate adaptation";
+        {
+            const juce::ScopedLock lock(messageLock);
+            if (renderGeneration.load() == generation)
+                renderMessage = "Could not start sample rate adaptation";
+        }
+        RVC_WRITE_DEBUG_LOG(this, "adaptRenderedAudioToSampleRate.discard",
+                            "reason=thread-launch-failed, generation="
+                            + juce::String(generation));
     }
 }
 

@@ -4,6 +4,8 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "Minimum macOS version for p
 
 project(RvcPlugin VERSION 0.1.0)
 
+option(RVC_DEBUG_LOG "Enable temporary RVC lifecycle debug logging" ON)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Build universal macOS binaries by default")
@@ -45,6 +47,7 @@ target_compile_definitions(RvcPlugin
     PUBLIC
         JUCE_WEB_BROWSER=1
         JUCE_USE_CURL=0
+        RVC_DEBUG_LOG=$<BOOL:${RVC_DEBUG_LOG}>
         RVC_ENABLE_ONNXRUNTIME=0)
 
 target_link_libraries(RvcPlugin
