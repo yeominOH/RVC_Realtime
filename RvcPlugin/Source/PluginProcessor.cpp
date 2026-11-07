@@ -769,7 +769,46 @@ void RvcAudioProcessor::setSelectedModelIndex(int index)
                         + ", invalidate="
                         + juce::String(previousIndex == index ? "false" : "true"));
     if (previousIndex == index)
+    {
+        auto shouldClearMissingModelMessage = false;
+        {
+            const juce::ScopedLock lock(messageLock);
+            shouldClearMissingModelMessage = renderMessage == "Model not found - choose a model";
+        }
+
+        if (! shouldClearMissingModelMessage)
+            return;
+
+        juce::String resultModelId;
+        auto resultPitch = 0;
+        {
+            const juce::ScopedLock lock(sessionLock);
+            resultModelId = renderedModelId;
+            resultPitch = renderedPitch;
+        }
+
+        auto hasRenderedResult = false;
+        {
+            const juce::ScopedLock lock(renderedLock);
+            hasRenderedResult = renderedAudio.getNumChannels() > 0
+                             && renderedAudio.getNumSamples() > 0;
+        }
+
+        const auto hasCapture = capturedSamplesAtomic.load() > 0;
+        const auto resultMatchesSelection = hasCapture
+                                         && hasRenderedResult
+                                         && resultModelId == getModelIdForIndex(index)
+                                         && resultPitch == pitchShiftSemitones.load();
+        renderReady.store(resultMatchesSelection);
+        renderFailed.store(false);
+        renderProgress.store(resultMatchesSelection ? 1.0f : 0.0f);
+        {
+            const juce::ScopedLock lock(messageLock);
+            renderMessage = resultMatchesSelection ? "Transform ready - press play"
+                          : (hasCapture ? "Ready to transform" : "Waiting for capture");
+        }
         return;
+    }
 
     if (renderInProgress.load())
         cancelManualRender();
