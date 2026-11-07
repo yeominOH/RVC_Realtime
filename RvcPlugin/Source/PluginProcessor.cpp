@@ -679,6 +679,7 @@ juce::String RvcAudioProcessor::getCaptureStatus() const
 juce::File RvcAudioProcessor::getSessionsRoot()
 {
     return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+        .getChildFile("Application Support")
         .getChildFile("RVC")
         .getChildFile("Sessions");
 }
