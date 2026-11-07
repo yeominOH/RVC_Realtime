@@ -79,6 +79,8 @@ private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameters();
     void timerCallback() override;
     void trimCaptureBufferToLength();
+    void scheduleCaptureSave();
+    void saveCaptureSynchronouslyIfNeeded();
     void createNewSession();
     static juce::File getSessionsRoot();
     static juce::File getSessionDirectory(const juce::String& id);
@@ -151,6 +153,9 @@ private:
     int sessionRenderSequence = 0;
     int renderedModelIndex = -1;
     int renderedPitch = 0;
+    std::atomic<bool> captureSessionSaved { false };
+    std::atomic<bool> captureSessionSaveInProgress { false };
+    std::atomic<int> sessionBackgroundTasks { 0 };
 
     mutable juce::CriticalSection renderedLock;
     mutable juce::CriticalSection messageLock;

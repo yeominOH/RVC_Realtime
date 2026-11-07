@@ -106,6 +106,11 @@ RvcAudioProcessor::~RvcAudioProcessor()
                         + ", adaptationThreads="
                         + juce::String(sampleRateAdaptationThreads.load()));
     stopTimer();
+    captureActive.store(false);
+    trimCaptureBufferToLength();
+    while (sessionBackgroundTasks.load() > 0)
+        juce::Thread::sleep(10);
+    saveCaptureSynchronouslyIfNeeded();
     cancelManualRender();
     for (int i = 0; i < 500 && renderInProgress.load(); ++i)
         juce::Thread::sleep(10);
@@ -449,6 +454,8 @@ void RvcAudioProcessor::createNewSession()
     sessionRenderSequence = 0;
     renderedModelIndex = -1;
     renderedPitch = 0;
+    captureSessionSaved.store(false);
+    captureSessionSaveInProgress.store(false);
 }
 
 bool RvcAudioProcessor::writeFloatWavFile(const juce::File& file,
@@ -569,15 +576,15 @@ void RvcAudioProcessor::trimCaptureBufferToLength()
     int channelsToKeep = 0;
     {
         const juce::ScopedLock lock(captureLock);
-        if (captureActive.load() || capturedSamples <= 0
-            || captureBuffer.getNumSamples() == capturedSamples)
+        if (captureActive.load() || capturedSamples <= 0)
             return;
 
         samplesToKeep = capturedSamples;
         channelsToKeep = captureBuffer.getNumChannels();
     }
 
-    juce::AudioBuffer<float> trimmed(channelsToKeep, samplesToKeep);
+    juce::AudioBuffer<float> trimmed;
+    auto needsTrim = false;
     {
         const juce::ScopedLock lock(captureLock);
         if (captureActive.load() || capturedSamples != samplesToKeep
@@ -585,12 +592,133 @@ void RvcAudioProcessor::trimCaptureBufferToLength()
             || captureBuffer.getNumSamples() < samplesToKeep)
             return;
 
-        for (int ch = 0; ch < channelsToKeep; ++ch)
-            trimmed.copyFrom(ch, 0, captureBuffer, ch, 0, samplesToKeep);
+        needsTrim = captureBuffer.getNumSamples() != samplesToKeep;
+        if (needsTrim)
+        {
+            trimmed.setSize(channelsToKeep, samplesToKeep);
+            for (int ch = 0; ch < channelsToKeep; ++ch)
+                trimmed.copyFrom(ch, 0, captureBuffer, ch, 0, samplesToKeep);
 
-        captureBuffer = std::move(trimmed);
+            captureBuffer = std::move(trimmed);
+        }
         captureCapacitySamples = samplesToKeep;
     }
+
+    scheduleCaptureSave();
+}
+
+void RvcAudioProcessor::scheduleCaptureSave()
+{
+    if (captureActive.load() || capturedSamplesAtomic.load() <= 0
+        || captureSessionSaved.load())
+        return;
+
+    auto expected = false;
+    if (! captureSessionSaveInProgress.compare_exchange_strong(expected, true))
+        return;
+
+    juce::AudioBuffer<float> audioToSave;
+    int samplesToSave = 0;
+    const auto sampleRateToSave = captureSampleRate.load();
+    {
+        const juce::ScopedLock lock(captureLock);
+        samplesToSave = juce::jmin(capturedSamples, captureBuffer.getNumSamples());
+        if (samplesToSave > 0)
+        {
+            audioToSave.setSize(captureBuffer.getNumChannels(), samplesToSave);
+            for (int ch = 0; ch < audioToSave.getNumChannels(); ++ch)
+                audioToSave.copyFrom(ch, 0, captureBuffer, ch, 0, samplesToSave);
+        }
+    }
+
+    juce::String idToSave;
+    juce::File fileToSave;
+    {
+        const juce::ScopedLock lock(sessionLock);
+        idToSave = sessionId;
+        fileToSave = sessionCaptureFile;
+    }
+
+    if (samplesToSave <= 0 || sampleRateToSave <= 0.0 || idToSave.isEmpty())
+    {
+        captureSessionSaveInProgress.store(false);
+        return;
+    }
+
+    RVC_WRITE_DEBUG_LOG(this, "sessionCaptureSave.start",
+                        "sessionId=" + idToSave
+                        + ", samples=" + juce::String(samplesToSave));
+    sessionBackgroundTasks.fetch_add(1);
+    auto* processor = this;
+    const auto launched = juce::Thread::launch(
+        [processor, idToSave, fileToSave, audio = std::move(audioToSave),
+         samplesToSave, sampleRateToSave]() mutable
+        {
+            const auto ok = writeFloatWavFile(fileToSave, audio, samplesToSave,
+                                              sampleRateToSave);
+            auto isCurrentSession = false;
+            {
+                const juce::ScopedLock lock(processor->sessionLock);
+                isCurrentSession = processor->sessionId == idToSave;
+            }
+            if (isCurrentSession)
+            {
+                processor->captureSessionSaved.store(ok);
+                processor->captureSessionSaveInProgress.store(false);
+            }
+            RVC_WRITE_DEBUG_LOG(processor,
+                                ok ? "sessionCaptureSave.complete"
+                                   : "sessionCaptureSave.failed",
+                                "sessionId=" + idToSave);
+            processor->sessionBackgroundTasks.fetch_sub(1);
+        });
+
+    if (! launched)
+    {
+        sessionBackgroundTasks.fetch_sub(1);
+        captureSessionSaveInProgress.store(false);
+        RVC_WRITE_DEBUG_LOG(this, "sessionCaptureSave.failed",
+                            "sessionId=" + idToSave + ", reason=thread-launch");
+    }
+}
+
+void RvcAudioProcessor::saveCaptureSynchronouslyIfNeeded()
+{
+    if (capturedSamplesAtomic.load() <= 0 || captureSessionSaved.load())
+        return;
+
+    juce::AudioBuffer<float> audioToSave;
+    int samplesToSave = 0;
+    {
+        const juce::ScopedLock lock(captureLock);
+        samplesToSave = juce::jmin(capturedSamples, captureBuffer.getNumSamples());
+        if (samplesToSave > 0)
+        {
+            audioToSave.setSize(captureBuffer.getNumChannels(), samplesToSave);
+            for (int ch = 0; ch < audioToSave.getNumChannels(); ++ch)
+                audioToSave.copyFrom(ch, 0, captureBuffer, ch, 0, samplesToSave);
+        }
+    }
+
+    juce::String idToSave;
+    juce::File fileToSave;
+    {
+        const juce::ScopedLock lock(sessionLock);
+        idToSave = sessionId;
+        fileToSave = sessionCaptureFile;
+    }
+
+    if (samplesToSave <= 0 || captureSampleRate.load() <= 0.0 || idToSave.isEmpty())
+        return;
+
+    RVC_WRITE_DEBUG_LOG(this, "sessionCaptureSave.start",
+                        "sessionId=" + idToSave + ", mode=destructor");
+    const auto ok = writeFloatWavFile(fileToSave, audioToSave, samplesToSave,
+                                      captureSampleRate.load());
+    captureSessionSaved.store(ok);
+    RVC_WRITE_DEBUG_LOG(this,
+                        ok ? "sessionCaptureSave.complete" : "sessionCaptureSave.failed",
+                        "sessionId=" + idToSave + ", mode=destructor");
 }
 
 void RvcAudioProcessor::appendInputToCaptureBuffer(const juce::AudioBuffer<float>& buffer)
@@ -657,6 +785,13 @@ void RvcAudioProcessor::invalidateRenderedAudio(const juce::String& nextMessage)
         lastRenderedOutputSample = { 0.0f, 0.0f };
     }
     renderedPlaybackWasAudible.store(false);
+    {
+        const juce::ScopedLock lock(sessionLock);
+        sessionRenderFile = juce::File();
+        sessionRenderSequence = 0;
+        renderedModelIndex = -1;
+        renderedPitch = 0;
+    }
     renderReady.store(false);
     renderFailed.store(false);
     renderProgress.store(0.0f);
@@ -1086,11 +1221,19 @@ void RvcAudioProcessor::startManualRender()
 
     const auto outputFile = inputFile.getSiblingFile(inputFile.getFileNameWithoutExtension() + "_rendered.wav");
     const auto args = makeRenderArguments(inputFile, outputFile, model);
+    const auto modelIndexForRender = selectedModelIndex.load();
+    const auto pitchForRender = pitchShiftSemitones.load();
+    juce::String sessionIdForRender;
+    {
+        const juce::ScopedLock lock(sessionLock);
+        sessionIdForRender = sessionId;
+    }
     auto* processor = this;
 
     const auto launched = juce::Thread::launch([processor, args, inputFile, outputFile,
                                                  playableSamplesToRender, capturedAtSampleRate,
-                                                 generation]
+                                                 generation, sessionIdForRender,
+                                                 modelIndexForRender, pitchForRender]
     {
         bool ok = false;
         juce::String processOutput;
@@ -1169,6 +1312,7 @@ void RvcAudioProcessor::startManualRender()
         }
 
         auto committed = false;
+        juce::AudioBuffer<float> renderForSession;
         while (ok && processor->renderGeneration.load() == generation)
         {
             const auto latestSampleRate = processor->currentSampleRate.load();
@@ -1190,6 +1334,7 @@ void RvcAudioProcessor::startManualRender()
                     || std::abs(processor->currentSampleRate.load() - loadedSampleRate) > 1.0)
                     continue;
 
+                renderForSession.makeCopyOf(loaded);
                 processor->renderedAudio = std::move(loaded);
                 processor->renderedPlaybackPosition = 0;
                 processor->renderedPlayableSamples = juce::jlimit(
@@ -1202,6 +1347,37 @@ void RvcAudioProcessor::startManualRender()
                 committed = true;
             }
             break;
+        }
+
+        auto sessionRenderSaved = false;
+        if (committed && sessionIdForRender.isNotEmpty())
+        {
+            RVC_WRITE_DEBUG_LOG(processor, "sessionRenderSave.start",
+                                "sessionId=" + sessionIdForRender
+                                + ", generation=" + juce::String(generation));
+            juce::File savedRenderFile;
+            auto savedSequence = 0;
+            sessionRenderSaved = writeNewSessionRenderFile(
+                sessionIdForRender, renderForSession, loadedSampleRate,
+                savedRenderFile, savedSequence);
+
+            if (sessionRenderSaved && processor->renderGeneration.load() == generation)
+            {
+                const juce::ScopedLock lock(processor->sessionLock);
+                if (processor->sessionId == sessionIdForRender
+                    && processor->renderGeneration.load() == generation)
+                {
+                    processor->sessionRenderFile = savedRenderFile;
+                    processor->sessionRenderSequence = savedSequence;
+                    processor->renderedModelIndex = modelIndexForRender;
+                    processor->renderedPitch = pitchForRender;
+                }
+            }
+            RVC_WRITE_DEBUG_LOG(processor,
+                                sessionRenderSaved ? "sessionRenderSave.complete"
+                                                   : "sessionRenderSave.failed",
+                                "sessionId=" + sessionIdForRender
+                                + ", generation=" + juce::String(generation));
         }
 
         const auto currentGeneration = processor->renderGeneration.load() == generation;
