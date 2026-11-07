@@ -153,6 +153,8 @@ private:
     int sessionRenderSequence = 0;
     int renderedModelIndex = -1;
     int renderedPitch = 0;
+    double sessionRenderedSampleRate = 0.0;
+    int sessionRenderedPlayableSamples = 0;
     std::atomic<bool> captureSessionSaved { false };
     std::atomic<bool> captureSessionSaveInProgress { false };
     std::atomic<int> sessionBackgroundTasks { 0 };
