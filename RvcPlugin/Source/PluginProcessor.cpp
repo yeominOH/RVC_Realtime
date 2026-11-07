@@ -54,10 +54,10 @@ juce::CriticalSection& getSessionStorageLock()
     return lock;
 }
 
-bool writeFloatWavFileUnlocked(const juce::File& file,
-                               const juce::AudioBuffer<float>& audio,
-                               int numSamples,
-                               double sampleRate)
+bool writeFloatWavContents(const juce::File& file,
+                           const juce::AudioBuffer<float>& audio,
+                           int numSamples,
+                           double sampleRate)
 {
     if (audio.getNumChannels() <= 0 || numSamples <= 0 || sampleRate <= 0.0)
         return false;
@@ -75,8 +75,31 @@ bool writeFloatWavFileUnlocked(const juce::File& file,
     if (writer == nullptr)
         return false;
 
-    return writer->writeFromAudioSampleBuffer(
+    const auto written = writer->writeFromAudioSampleBuffer(
         audio, 0, juce::jmin(numSamples, audio.getNumSamples()));
+    writer.reset(); // Flush and close before the atomic rename.
+    return written;
+}
+
+bool writeFloatWavFileAtomicallyUnlocked(const juce::File& destination,
+                                         const juce::AudioBuffer<float>& audio,
+                                         int numSamples,
+                                         double sampleRate)
+{
+    if (destination.existsAsFile())
+        return true;
+
+    const auto temporary = destination.getSiblingFile(
+        destination.getFileName() + "." + juce::Uuid().toString() + ".tmp");
+    if (! writeFloatWavContents(temporary, audio, numSamples, sampleRate))
+        return false;
+
+    // A final file may have appeared while the temporary file was written.
+    // Never replace immutable session data; any leftover .tmp is ignored.
+    if (destination.existsAsFile())
+        return true;
+
+    return temporary.moveFileTo(destination);
 }
 }
 
@@ -714,13 +737,10 @@ bool RvcAudioProcessor::writeFloatWavFile(const juce::File& file,
                                           double sampleRate)
 {
     const juce::ScopedLock lock(getSessionStorageLock());
-    if (file.existsAsFile())
-        return true;
-
     if (! file.getParentDirectory().createDirectory())
         return false;
 
-    return writeFloatWavFileUnlocked(file, audio, numSamples, sampleRate);
+    return writeFloatWavFileAtomicallyUnlocked(file, audio, numSamples, sampleRate);
 }
 
 bool RvcAudioProcessor::writeNewSessionRenderFile(const juce::String& id,
@@ -745,7 +765,8 @@ bool RvcAudioProcessor::writeNewSessionRenderFile(const juce::String& id,
     }
 
     const auto nextFile = directory.getChildFile("render_" + juce::String(nextSequence) + ".wav");
-    if (! writeFloatWavFileUnlocked(nextFile, audio, audio.getNumSamples(), sampleRate))
+    if (! writeFloatWavFileAtomicallyUnlocked(nextFile, audio,
+                                               audio.getNumSamples(), sampleRate))
         return false;
 
     destination = nextFile;
@@ -757,6 +778,9 @@ bool RvcAudioProcessor::readFloatWavFile(const juce::File& file,
                                          juce::AudioBuffer<float>& destination,
                                          double& sampleRate)
 {
+    if (file.getFileName().endsWithIgnoreCase(".tmp"))
+        return false;
+
     const juce::ScopedLock lock(getSessionStorageLock());
     auto stream = file.createInputStream();
     if (stream == nullptr)
@@ -766,6 +790,7 @@ bool RvcAudioProcessor::readFloatWavFile(const juce::File& file,
     std::unique_ptr<juce::AudioFormatReader> reader(
         wav.createReaderFor(stream.release(), true));
     if (reader == nullptr || reader->lengthInSamples <= 0
+        || reader->numChannels == 0 || reader->sampleRate <= 0.0
         || reader->lengthInSamples > std::numeric_limits<int>::max())
         return false;
 
